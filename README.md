@@ -92,8 +92,9 @@ count only — never from source newlines: a list (SELECT items, SET
 assignments, RETURNING, GROUP BY, ORDER BY, VALUES tuples, ON conditions)
 stays inline if it fits in 80 columns at its level **and** has at most 4
 top-level items; otherwise the keyword sits alone and items go one per line
-at the next level with trailing commas. A comment or a multiline
-function-argument frame inside a group always breaks it.
+at the next level with trailing commas. A **leading** comment or a multiline
+function-argument frame inside a group always breaks it (a trailing comment
+does not — see the comments rule below).
 
 One documented exception to trailing commas: when an item is followed by a
 `--` comment, the comma moves to the start of the next item's line (a
@@ -133,7 +134,15 @@ trailing comma after a `--` comment would be swallowed by it).
   own line (the `DO` action glued to the conflict target);
 - blank lines appear only between statements (after `;`) and between CTE
   definitions (after each `name AS (...),`);
-- comments always sit on their own line, at the indent of their slot;
+- comments: a **leading** comment (no code before it on its source line)
+  sits on its own line, at the indent of its slot; a **trailing** comment
+  (code precedes it on the same line) rides that code's line instead of
+  forcing a break — a trailing `--` breaks hard when it is not the last
+  atom of its clause/range, and always inside a parenthesized range (the
+  closing `)` would land on the comment's line and be swallowed), and
+  contiguous lines ending in trailing comments are
+  padded so all their comments start at one shared column (skipped when
+  the shared column would exceed the 80-column limit);
 - between a bare identifier and `(` the source spacing is preserved (a
   table name and a function call are indistinguishable without parsing);
 - the literal's original indentation is re-applied to every formatted line

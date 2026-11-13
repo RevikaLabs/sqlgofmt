@@ -42,6 +42,9 @@ type atom struct {
 	text  string // raw source text (format verbs restored)
 	start int    // byte offset in the original SQL text
 	end   int
+	// trailing: a comment with real code before it on the same source
+	// line — it may ride that code's line instead of forcing a break.
+	trailing bool
 }
 
 // ddlStartKeywords are statement keywords whose literals the formatter
@@ -469,6 +472,12 @@ func atomize(src, masked string) ([]atom, bool) {
 		atoms = append(atoms, atom{kind: atomComment, text: strings.TrimRight(src[s:e], "\r\n"), start: s, end: e})
 	}
 	sort.Slice(atoms, func(i, j int) bool { return atoms[i].start < atoms[j].start })
+	for i := range atoms {
+		if atoms[i].kind != atomComment || i == 0 {
+			continue
+		}
+		atoms[i].trailing = !strings.ContainsAny(src[atoms[i-1].end:atoms[i].start], "\n")
+	}
 	return atoms, true
 }
 
@@ -967,6 +976,23 @@ type layouter struct {
 	// pendingBreak forces the next clause onto a fresh line (set when a
 	// frame's "(" just terminated its line, per D6).
 	pendingBreak bool
+	// lineNo is the index of the pending line: how many newlines have
+	// been written to out so far.
+	lineNo int
+	// trailMarks records where trailing comments were written inline,
+	// for the shared-column alignment post-pass.
+	trailMarks []trailMark
+}
+
+// trailMark is one inline trailing comment: the output line index, the
+// rune column where the comment text starts, and the comment text itself
+// (the post-pass verifies the line actually starts with it — multiline
+// atoms can make bookkeeping drift, and padding must never land in the
+// middle of a string literal or comment).
+type trailMark struct {
+	line int
+	col  int
+	text string
 }
 
 func render(atoms []atom, src, unit string) string {
@@ -974,7 +1000,47 @@ func render(atoms []atom, src, unit string) string {
 	l.lineOpen = true
 	l.emitBlock(atoms, 0)
 	l.flush()
-	return l.out.String()
+	return alignTrailingComments(l.out.String(), l.trailMarks)
+}
+
+// alignTrailingComments pads contiguous lines that end in a trailing
+// comment so every comment in a run starts at the same column. Padding is
+// whitespace only: the identity gate (same atom stream) is unaffected.
+// A run is skipped when the target column would exceed widthLimit, and a
+// mark is skipped when its line does not actually start with the recorded
+// comment at the recorded column (multiline-atom drift).
+func alignTrailingComments(out string, marks []trailMark) string {
+	if len(marks) == 0 {
+		return out
+	}
+	lines := strings.Split(out, "\n")
+	sort.Slice(marks, func(i, j int) bool { return marks[i].line < marks[j].line })
+	for g := 0; g < len(marks); {
+		e := g + 1
+		for e < len(marks) && marks[e].line == marks[e-1].line+1 {
+			e++
+		}
+		target := marks[g].col
+		for _, m := range marks[g:e] {
+			if m.col > target {
+				target = m.col
+			}
+		}
+		if target <= widthLimit {
+			for _, m := range marks[g:e] {
+				if m.line >= len(lines) || m.col >= target {
+					continue
+				}
+				runes := []rune(lines[m.line])
+				if m.col > len(runes) || !strings.HasPrefix(string(runes[m.col:]), m.text) {
+					continue
+				}
+				lines[m.line] = string(runes[:m.col]) + strings.Repeat(" ", target-m.col) + string(runes[m.col:])
+			}
+		}
+		g = e
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (l *layouter) flush() {
@@ -994,9 +1060,11 @@ func (l *layouter) br(level int) {
 		l.flush()
 		l.out.WriteString("\n")
 		l.outEndsNL = true
+		l.lineNo++
 	} else if !l.outEndsNL && l.out.Len() > 0 {
 		l.out.WriteString("\n")
 		l.outEndsNL = true
+		l.lineNo++
 	}
 	l.cur.Reset()
 	l.cur.WriteString(strings.Repeat(l.unit, level))
@@ -1018,11 +1086,26 @@ func (l *layouter) blankLine() {
 	l.out.WriteString("\n")
 	l.out.WriteString("\n")
 	l.outEndsNL = true
+	l.lineNo += 2
 }
 
 func (l *layouter) writeRaw(s string) {
+	l.writeText(s)
+}
+
+// writeText appends s to the pending line, accounting for embedded
+// newlines (multiline block comments, string literals): lineNo advances
+// and curRunes resets to the length after the last newline.
+func (l *layouter) writeText(s string) {
 	l.cur.WriteString(s)
-	l.curRunes += utf8.RuneCountInString(s)
+	if n := strings.Count(s, "\n"); n > 0 {
+		l.lineNo += n
+		if i := strings.LastIndexByte(s, '\n'); i >= 0 {
+			l.curRunes = utf8.RuneCountInString(s[i+1:])
+		}
+	} else {
+		l.curRunes += utf8.RuneCountInString(s)
+	}
 	l.curHasTok = true
 }
 
@@ -1038,12 +1121,19 @@ func (l *layouter) writeAtom(a *atom) {
 		// Never continue a "--" comment line: break first.
 		l.br(l.curLevel)
 	}
+	if a.kind == atomComment && a.trailing && l.curHasTok {
+		// Record before writing: the mark must point at the column the
+		// comment text will start at (indent + content + separator gap).
+		col := l.unitW*l.curLevel + l.curRunes
+		if needSpace(l.lastA, l.last2A, a, l.src) {
+			col++
+		}
+		l.trailMarks = append(l.trailMarks, trailMark{line: l.lineNo, col: col, text: a.text})
+	}
 	if l.curHasTok && needSpace(l.lastA, l.last2A, a, l.src) {
 		l.writeRaw(" ")
 	}
-	l.cur.WriteString(a.text)
-	l.curRunes += utf8.RuneCountInString(a.text)
-	l.curHasTok = true
+	l.writeText(a.text)
 	l.last2A, l.lastA = l.lastA, a
 }
 
@@ -1071,6 +1161,15 @@ func (l *layouter) fitsAhead(level, flat int, first *atom) bool {
 // reports whether the range contains a hard-break trigger: a comment or a
 // multiline args frame (at any depth).
 func (l *layouter) flatHard(atoms []atom) (int, bool) {
+	return l.flatHardEnd(atoms, true)
+}
+
+// flatHardEnd is flatHard with atEnd reporting whether the range's last
+// atom is genuinely the end of a line when emitted (a clause end). In a
+// nested range (paren content) a trailing "--" is followed by the closing
+// paren on its own line, so treating it as soft would make the width math
+// lie.
+func (l *layouter) flatHardEnd(atoms []atom, atEnd bool) (int, bool) {
 	hard := false
 	width := 0
 	var prev, prev2 *atom
@@ -1078,6 +1177,20 @@ func (l *layouter) flatHard(atoms []atom) (int, bool) {
 	for i < len(atoms) {
 		a := &atoms[i]
 		if a.kind == atomComment {
+			// A trailing comment that ends the range (or a block comment,
+			// which cannot swallow what follows) rides the line: count its
+			// width instead of forcing a break. A trailing "--" mid-range
+			// stays hard: the atoms after it would land on the comment's
+			// line, and the width math would lie.
+			if a.trailing && (!strings.HasPrefix(a.text, "--") || (atEnd && i == len(atoms)-1)) {
+				if needSpace(prev, prev2, a, l.src) {
+					width++
+				}
+				width += utf8.RuneCountInString(a.text)
+				prev2, prev = prev, a
+				i++
+				continue
+			}
 			hard = true
 			prev2, prev = prev, a
 			i++
@@ -1099,7 +1212,7 @@ func (l *layouter) flatHard(atoms []atom) (int, bool) {
 			if frameKindOf(inner) == frameArgs && strings.Contains(l.src[a.end:rp.start], "\n") {
 				hard = true
 			}
-			w, h := l.flatHard(inner)
+			w, h := l.flatHardEnd(inner, false)
 			if h {
 				hard = true
 			}
@@ -1222,6 +1335,13 @@ func argsFrameStart(l *layouter, atoms []atom) (int, int, bool) {
 
 func (l *layouter) emitClause(stmt []atom, seg *clauseSeg, level int) {
 	l.settle(level)
+	if l.onLineComment() {
+		// fitsAhead refuses to append to a "--" comment line (G14); move
+		// to a fresh line so the clause is laid out on its own merits
+		// (it may still glue: e.g. OFFSET 5 below a trailing comment).
+		l.br(level)
+		l.lineOpen = true
+	}
 	kw := stmt[seg.start:seg.kwEnd]
 	rest := stmt[seg.kwEnd:seg.end]
 	flatAll, hard := l.flatHard(stmt[seg.start:seg.end])
@@ -1443,13 +1563,24 @@ func (l *layouter) emitCommaItems(items [][]atom, seps []*atom, level int) {
 	l.lineOpen = false
 	deferred := false
 	for ii, item := range items {
-		l.br(level + 1)
-		if deferred {
-			l.writeRaw(",")
-			l.last2A, l.lastA = nil, seps[ii-1]
-			deferred = false
+		// A trailing comment after the separator ("bbb, -- note") rides
+		// the previous item's line; the item's own content still starts a
+		// fresh line. With a deferred comma the ride branch would drop
+		// the separator, so go through the regular branch where it is
+		// written at the top of the next item's line.
+		if len(item) > 0 && item[0].kind == atomComment && item[0].trailing && l.curHasTok && !deferred {
+			l.writeAtom(&item[0])
+			l.br(level + 1)
+			l.emitExpr(item[1:], level+1)
+		} else {
+			l.br(level + 1)
+			if deferred {
+				l.writeRaw(",")
+				l.last2A, l.lastA = nil, seps[ii-1]
+				deferred = false
+			}
+			l.emitExpr(item, level+1)
 		}
-		l.emitExpr(item, level+1)
 		if ii < len(seps) {
 			if l.curHasTok && l.lastA != nil && l.lastA.kind == atomComment {
 				deferred = true
@@ -1763,8 +1894,12 @@ func (l *layouter) emitExpr(atoms []atom, level int) {
 		a := &atoms[i]
 		switch {
 		case a.kind == atomComment:
-			l.br(level)
-			l.writeAtom(a)
+			if a.trailing && l.curHasTok {
+				l.writeAtom(a)
+			} else {
+				l.br(level)
+				l.writeAtom(a)
+			}
 		case a.ttype == models.TokenTypeLParen:
 			j := matchParen(atoms, i)
 			if j < 0 {

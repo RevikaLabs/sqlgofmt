@@ -593,6 +593,120 @@ func TestSkipReasons(t *testing.T) {
 	}
 }
 
+// TestTrailingComments pins the trailing-comment behavior: a comment with
+// code before it on the same source line ("trailing") rides that line
+// instead of forcing a break, and contiguous lines with trailing comments
+// are padded to one shared comment column. Leading comments (own source
+// line) keep the old own-line behavior.
+func TestTrailingComments(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "trailing comment rides its list item",
+			in:   "SELECT a, b, c, d, e -- last one\nFROM t",
+			want: "SELECT\n" +
+				"\ta,\n" +
+				"\tb,\n" +
+				"\tc,\n" +
+				"\td,\n" +
+				"\te -- last one\n" +
+				"FROM t",
+		},
+		{
+			name: "trailing block comment keeps clause inline",
+			in:   "SELECT a, b /* note */ FROM t",
+			want: "SELECT a, b /* note */ FROM t",
+		},
+		{
+			name: "trailing comment after comma rides previous item's line",
+			in:   "SELECT aaa, bbb, -- note\nccc, ddd FROM t",
+			want: "SELECT\n" +
+				"\taaa,\n" +
+				"\tbbb, -- note\n" +
+				"\tccc,\n" +
+				"\tddd\n" +
+				"FROM t",
+		},
+		{
+			name: "where chain with trailing comments rides and aligns",
+			in:   "SELECT 1 FROM t\nWHERE aaaa = 1 -- first\nAND bbbb = 2 -- second",
+			want: "SELECT 1 FROM t\n" +
+				"WHERE aaaa = 1 -- first\n" +
+				"\tAND bbbb = 2  -- second",
+		},
+	}
+	for _, tc := range cases {
+		got, ok := Layout(tc.in, "")
+		if !ok {
+			t.Fatalf("%s: Layout rejected literal", tc.name)
+		}
+		if got != tc.want {
+			t.Fatalf("%s:\n--- got ---\n%s\n--- want ---\n%s", tc.name, got, tc.want)
+		}
+		again, ok := Layout(got, "")
+		if !ok {
+			t.Fatalf("%s: re-layout rejected its own output", tc.name)
+		}
+		if again != got {
+			t.Fatalf("%s: not idempotent\n--- second ---\n%s\n--- first ---\n%s", tc.name, again, got)
+		}
+	}
+
+	// Multiline atoms (block comments, string literals with embedded
+	// newlines) advance the line counter: alignment marks must stay on
+	// the comment's real line, never inside a string literal.
+	multi := []string{
+		"SELECT /* x\ny */ a, -- c1\n b -- c2\nFROM t",
+		"SELECT 'p\nq' AS s, -- c1\n b -- c2\nFROM t",
+		"SELECT f(a -- c\n) FROM t",
+		"SELECT " + strings.Repeat("long_column_name_here, ", 4) + "last_item -- a very long trailing comment that pushes far past the limit\nFROM t",
+		// Item ending in a comment (comma deferred) followed by an item
+		// starting with a trailing comment: the ride branch must not eat
+		// the deferred comma — previously this literal was silently
+		// rejected (ReasonParse) instead of formatted.
+		"SELECT b /* x */, /* y */ c, d, e, f FROM t",
+	}
+	for _, in := range multi {
+		got, ok := Layout(in, "")
+		if !ok {
+			t.Fatalf("multiline atom case rejected: %q", in)
+		}
+		again, ok := Layout(got, "")
+		if !ok || again != got {
+			t.Fatalf("multiline atom case not idempotent\n--- in ---\n%s\n--- once ---\n%s\n--- twice ---\n%s", in, got, again)
+		}
+		for _, line := range strings.Split(got, "\n") {
+			if strings.Contains(line, "'p") && strings.Contains(line, "  ") {
+				t.Fatalf("padding leaked into a string literal line:\n%s", got)
+			}
+		}
+	}
+
+	// A run of adjacent >80-column lines with trailing comments must NOT
+	// be padded (the shared column would exceed widthLimit): each comment
+	// keeps its single separator space. Guards the target <= widthLimit
+	// branch of alignTrailingComments.
+	long := "SELECT 1 FROM t\n" +
+		"WHERE " + strings.Repeat("x", 70) + " >= 100000 -- first\n" +
+		"AND " + strings.Repeat("y", 70) + " <= 200000 -- second"
+	got, ok := Layout(long, "")
+	if !ok {
+		t.Fatal("over-limit run case rejected")
+	}
+	again, ok := Layout(got, "")
+	if !ok || again != got {
+		t.Fatalf("over-limit run case not idempotent\n--- once ---\n%s\n--- twice ---\n%s", got, again)
+	}
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasSuffix(line, "  -- first") || strings.HasSuffix(line, "  -- second") {
+			t.Fatalf("comments aligned past the 80-column limit:\n%s", got)
+		}
+	}
+}
+
 // TestG5cOuterJoinMerged pins the merged "left outer join" handling: the
 // tokenizer emits LEFT + "OUTER JOIN" (merged) as separate atoms; they
 // form ONE join unit (no split), get UPPER CASE, and the 4-join cap
@@ -984,10 +1098,9 @@ func TestLayoutIdentifierParenSpacing(t *testing.T) {
 // on its own line at the item level.
 func TestLayoutCommentsOwnLine(t *testing.T) {
 	in := "SELECT a -- note\nFROM t"
-	want := "SELECT\n" +
-		"\ta\n" +
-		"\t-- note\n" +
-		"FROM t"
+	// A trailing comment (code before it on the same source line) rides
+	// its line; a leading comment keeps its own line (TestTrailingComments).
+	want := "SELECT a -- note\nFROM t"
 	got, ok := Layout(in, "")
 	if !ok {
 		t.Fatal("Layout rejected comment input")
