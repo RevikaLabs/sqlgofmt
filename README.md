@@ -48,6 +48,12 @@ A raw string literal is formatted only when **all** of the following hold:
   them for parsing and emits them byte-exact;
 - it contains no `::::` run of colons (sqlx escapes named parameters by
   doubling colons — such literals are skipped);
+- it contains no nested block comment (`/* /* */ */`): PostgreSQL nests
+  block comments, the tokenizer does not, so the nested comment's tail
+  would be re-tokenized as SQL code (`ReasonNestedComment`). The check
+  runs for every dialect — MySQL/ClickHouse block comments do not nest,
+  so such literals may be skipped unnecessarily, which is the safe
+  direction;
 - it is not preceded (same or previous line) by a `//sqlgofmt:ignore` comment;
 - it starts (after trimming, case-insensitive) with a DML/procedural SQL
   keyword: `SELECT, INSERT, UPDATE, DELETE, WITH, BEGIN, COMMIT, ROLLBACK,

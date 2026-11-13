@@ -528,7 +528,7 @@ func TestG5bJoinCap(t *testing.T) {
 // LayoutWithReason end-to-end, including the ReasonUnsafe token guard.
 func TestSkipReasons(t *testing.T) {
 	// SkipString covers every reason with a non-empty message.
-	for _, r := range []SkipReason{ReasonEmpty, ReasonDDL, ReasonSQLXEscape, ReasonParse, ReasonUnsafe} {
+	for _, r := range []SkipReason{ReasonEmpty, ReasonDDL, ReasonSQLXEscape, ReasonParse, ReasonUnsafe, ReasonNestedComment} {
 		if SkipString(r) == "" {
 			t.Fatalf("SkipString(%d) is empty", r)
 		}
@@ -543,6 +543,13 @@ func TestSkipReasons(t *testing.T) {
 		{"ddl", "CREATE TABLE t (id int)", ReasonDDL},
 		{"sqlx escape", "SELECT id FROM t WHERE u = :u::::text", ReasonSQLXEscape},
 		{"invalid sql", "SELECT FROM WHERE", ReasonParse},
+		// PostgreSQL block comments nest; GoSQLX stops at the first */
+		// and treats the tail as real tokens, so such literals are skipped.
+		{"nested block comment", "SELECT 1 /* outer /* inner */ + 2 */", ReasonNestedComment},
+		{"nested tight", "SELECT 1 /*/* x */ */", ReasonNestedComment},
+		// '$' inside an identifier is not a dollar quote: the scan must
+		// not give up at an identifier like a$b$.
+		{"nested after dollar ident", "SELECT a$b$ FROM t /* x /* y */ */", ReasonNestedComment},
 	}
 	for _, tc := range cases {
 		var got SkipReason
@@ -560,6 +567,25 @@ func TestSkipReasons(t *testing.T) {
 	// indirectly by the atom-guard runtime path; here we only pin that
 	// the guard code compiles into the same fail() funnel as other
 	// reasons (ReasonParse above uses the same mechanism).
+
+	// Control cases: "/*" inside string literals and normal flat block
+	// comments must not trip the nested-comment gate.
+	for _, tc := range []struct{ name, sql string }{
+		{"block comment in string", "SELECT '/* not a /* comment */' FROM t"},
+		{"flat block comment", "SELECT /* hello */ a FROM t"},
+		{"comment before string", "SELECT /* a */ 'b' FROM t"},
+		{"dollar-quoted string", "SELECT $$ /* /* $$ FROM t"},
+		{"tagged dollar-quoted string", "SELECT $x$ /* /* $x$ FROM t"},
+		{"comment chars in quoted identifier", `SELECT "a/*b" FROM t`},
+		{"comment opener in line comment", "SELECT a -- /* /*\nFROM t"},
+	} {
+		var got SkipReason
+		if out, ok := LayoutWithReason(tc.sql, "", &got); !ok {
+			t.Fatalf("%s: Layout rejected literal (reason %d)", tc.name, got)
+		} else if _, ok := LayoutWithReason(out, "", &got); !ok {
+			t.Fatalf("%s: output not idempotent (reason %d)", tc.name, got)
+		}
+	}
 
 	// Plain Layout with no reason pointer: unchanged contract.
 	if _, ok := Layout("CREATE TABLE t (id int)", ""); ok {

@@ -154,6 +154,8 @@ func SkipString(r SkipReason) string {
 		return "invalid SQL: rejected by the parse gate"
 	case ReasonUnsafe:
 		return "unsafe to re-layout (token stream would change)"
+	case ReasonNestedComment:
+		return "nested block comment: tokenizer would mis-tokenize the tail"
 	}
 	return ""
 }
@@ -172,6 +174,10 @@ const (
 	ReasonParse
 	// ReasonUnsafe: the re-laid-out output would change tokens.
 	ReasonUnsafe
+	// ReasonNestedComment: PostgreSQL block comments nest (/* /* */ */)
+	// but the tokenizer does not, so the comment tail would be re-tokenized
+	// as SQL code.
+	ReasonNestedComment
 	// ReasonOK is zero value only; Layout never returns it with ok=false.
 	ReasonOK
 )
@@ -192,6 +198,9 @@ func layout(sqlText string, indentStr string, reason *SkipReason, dialect ...str
 	}
 	if strings.Contains(sqlText, "::::") {
 		return fail(ReasonSQLXEscape)
+	}
+	if hasNestedBlockComment(sqlText) {
+		return fail(ReasonNestedComment)
 	}
 	d := "postgresql"
 	if len(dialect) > 0 && dialect[0] != "" {
@@ -276,6 +285,128 @@ func maskSpans(src string, spans [][]int) string {
 func parsesOK(masked, dialect string) bool {
 	_, err := gosqlx.ParseTree(context.Background(), masked, gosqlx.WithDialect(dialect))
 	return err == nil
+}
+
+// scanState is the lexer context of hasNestedBlockComment.
+type scanState int
+
+const (
+	scanNormal scanState = iota
+	scanLineComment
+	scanBlockComment
+	scanSingleQuote
+	scanDoubleQuote
+)
+
+// hasNestedBlockComment reports whether a block comment is nested inside
+// another block comment. PostgreSQL nests /* /* */ */; the tokenizer does
+// not (it stops at the first */), so the tail would be re-tokenized as
+// SQL code. "/*" and "*/" inside string literals, quoted identifiers and
+// dollar-quoted strings do not count. Single-quote state follows ''
+// doubling; E'...\'...' backslash escapes are not tracked (such literals
+// are rare and the parse gate still applies).
+func hasNestedBlockComment(sql string) bool {
+	state := scanNormal
+	depth := 0
+	for i := 0; i < len(sql); i++ {
+		c := sql[i]
+		switch state {
+		case scanLineComment:
+			if c == '\n' {
+				state = scanNormal
+			}
+		case scanBlockComment:
+			switch {
+			case c == '/' && strings.HasPrefix(sql[i:], "/*"):
+				depth++
+				if depth > 1 {
+					return true
+				}
+				i++
+			case strings.HasPrefix(sql[i:], "*/"):
+				depth--
+				if depth == 0 {
+					state = scanNormal
+				}
+				i++
+			}
+		case scanSingleQuote:
+			if c == '\'' {
+				if strings.HasPrefix(sql[i+1:], "'") {
+					i++
+				} else {
+					state = scanNormal
+				}
+			}
+		case scanDoubleQuote:
+			if c == '"' {
+				if strings.HasPrefix(sql[i+1:], "\"") {
+					i++
+				} else {
+					state = scanNormal
+				}
+			}
+		case scanNormal:
+			switch {
+			case strings.HasPrefix(sql[i:], "--"):
+				state = scanLineComment
+				i++
+			case strings.HasPrefix(sql[i:], "/*"):
+				state = scanBlockComment
+				depth = 1
+				i++
+			case c == '\'':
+				state = scanSingleQuote
+			case c == '"':
+				state = scanDoubleQuote
+			case c == '$':
+				// A dollar tag cannot follow an identifier character:
+				// "a$b" is one identifier, not a dollar quote.
+				if i > 0 && isDollarIdentByte(sql[i-1]) {
+					continue
+				}
+				tag, ok := dollarTagAt(sql, i)
+				if !ok {
+					continue
+				}
+				open := len(tag) + 2 // $tag$
+				closeIdx := strings.Index(sql[i+open:], "$"+tag+"$")
+				if closeIdx < 0 {
+					// Unterminated dollar quote: not a dollar-quote
+					// context we can trust; keep scanning so a nested
+					// comment later in the text is still caught (the
+					// parse gate rejects the unterminated quote anyway).
+					continue
+				}
+				i += open + closeIdx + len(tag) + 1
+			}
+		}
+	}
+	return false
+}
+
+// dollarTagAt parses a dollar-quote opening delimiter at sql[i] == '$':
+// "$$" (empty tag) or "$tag$" with a tag of letters, digits or underscore.
+func dollarTagAt(sql string, i int) (tag string, ok bool) {
+	j := i + 1
+	for j < len(sql) && (sql[j] == '_' || isASCIILetterOrDigit(sql[j])) {
+		j++
+	}
+	if j >= len(sql) || sql[j] != '$' {
+		return "", false
+	}
+	return sql[i+1 : j], true
+}
+
+func isASCIILetterOrDigit(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+}
+
+// isDollarIdentByte reports whether c can be part of an identifier that
+// may legally contain '$' (PostgreSQL identifiers allow $ after the
+// first character).
+func isDollarIdentByte(c byte) bool {
+	return isASCIILetterOrDigit(c) || c == '_' || c == '$'
 }
 
 // atomize tokenizes masked SQL and merges tokens with comments into a
