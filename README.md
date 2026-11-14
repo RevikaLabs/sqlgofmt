@@ -206,3 +206,27 @@ same line or directly above it:
 const q = `
 select * from t`
 ```
+
+## Inspiration
+
+sqlgofmt borrows several ideas from
+[dimitri/sqlfmt](https://github.com/dimitri/sqlfmt), Dimitri Fontaine's
+PostgreSQL-focused SQL formatter:
+
+- **Comments as metadata** — a comment rides the code line it trailed in the
+  source instead of forcing a break, and neighbouring lines whose comments
+  all trail are padded to one shared comment column (sqlfmt's
+  comment-attachment, minus the river style itself);
+- **Fill for argument lists** — an overflowing single-line argument frame
+  packs items onto as few lines as fit (Wadler-style fill, sqlfmt's group
+  model) instead of staying inline forever;
+- **Testing discipline** — a reviewed corpus of canonical fixtures, a
+  property-based fuzzer, and a real-parser oracle: sqlfmt verifies output
+  with `pg_query` fingerprints; we compare full parse trees via
+  `pg_query.Parse` behind the `pgquery` build tag.
+
+Ideas considered and deliberately left out: the river layout (padding every
+line to a shared widest prefix fights the Go file's own re-indentation of
+the literal), a full Doc IR (the in-place `fitsAhead`/break machinery
+already implements the fill pattern), and sqlfmt's diff/explain tooling.
+
