@@ -42,6 +42,9 @@ type atom struct {
 	text  string // raw source text (format verbs restored)
 	start int    // byte offset in the original SQL text
 	end   int
+	// trailing: a comment with real code before it on the same source
+	// line — it may ride that code's line instead of forcing a break.
+	trailing bool
 }
 
 // ddlStartKeywords are statement keywords whose literals the formatter
@@ -154,6 +157,8 @@ func SkipString(r SkipReason) string {
 		return "invalid SQL: rejected by the parse gate"
 	case ReasonUnsafe:
 		return "unsafe to re-layout (token stream would change)"
+	case ReasonNestedComment:
+		return "nested block comment: tokenizer would mis-tokenize the tail"
 	}
 	return ""
 }
@@ -172,6 +177,10 @@ const (
 	ReasonParse
 	// ReasonUnsafe: the re-laid-out output would change tokens.
 	ReasonUnsafe
+	// ReasonNestedComment: PostgreSQL block comments nest (/* /* */ */)
+	// but the tokenizer does not, so the comment tail would be re-tokenized
+	// as SQL code.
+	ReasonNestedComment
 	// ReasonOK is zero value only; Layout never returns it with ok=false.
 	ReasonOK
 )
@@ -192,6 +201,9 @@ func layout(sqlText string, indentStr string, reason *SkipReason, dialect ...str
 	}
 	if strings.Contains(sqlText, "::::") {
 		return fail(ReasonSQLXEscape)
+	}
+	if hasNestedBlockComment(sqlText) {
+		return fail(ReasonNestedComment)
 	}
 	d := "postgresql"
 	if len(dialect) > 0 && dialect[0] != "" {
@@ -278,6 +290,128 @@ func parsesOK(masked, dialect string) bool {
 	return err == nil
 }
 
+// scanState is the lexer context of hasNestedBlockComment.
+type scanState int
+
+const (
+	scanNormal scanState = iota
+	scanLineComment
+	scanBlockComment
+	scanSingleQuote
+	scanDoubleQuote
+)
+
+// hasNestedBlockComment reports whether a block comment is nested inside
+// another block comment. PostgreSQL nests /* /* */ */; the tokenizer does
+// not (it stops at the first */), so the tail would be re-tokenized as
+// SQL code. "/*" and "*/" inside string literals, quoted identifiers and
+// dollar-quoted strings do not count. Single-quote state follows doubled
+// quotes; E'...\'...' backslash escapes are not tracked (such literals
+// are rare and the parse gate still applies).
+func hasNestedBlockComment(sql string) bool {
+	state := scanNormal
+	depth := 0
+	for i := 0; i < len(sql); i++ {
+		c := sql[i]
+		switch state {
+		case scanLineComment:
+			if c == '\n' {
+				state = scanNormal
+			}
+		case scanBlockComment:
+			switch {
+			case c == '/' && strings.HasPrefix(sql[i:], "/*"):
+				depth++
+				if depth > 1 {
+					return true
+				}
+				i++
+			case strings.HasPrefix(sql[i:], "*/"):
+				depth--
+				if depth == 0 {
+					state = scanNormal
+				}
+				i++
+			}
+		case scanSingleQuote:
+			if c == '\'' {
+				if strings.HasPrefix(sql[i+1:], "'") {
+					i++
+				} else {
+					state = scanNormal
+				}
+			}
+		case scanDoubleQuote:
+			if c == '"' {
+				if strings.HasPrefix(sql[i+1:], "\"") {
+					i++
+				} else {
+					state = scanNormal
+				}
+			}
+		case scanNormal:
+			switch {
+			case strings.HasPrefix(sql[i:], "--"):
+				state = scanLineComment
+				i++
+			case strings.HasPrefix(sql[i:], "/*"):
+				state = scanBlockComment
+				depth = 1
+				i++
+			case c == '\'':
+				state = scanSingleQuote
+			case c == '"':
+				state = scanDoubleQuote
+			case c == '$':
+				// A dollar tag cannot follow an identifier character:
+				// "a$b" is one identifier, not a dollar quote.
+				if i > 0 && isDollarIdentByte(sql[i-1]) {
+					continue
+				}
+				tag, ok := dollarTagAt(sql, i)
+				if !ok {
+					continue
+				}
+				open := len(tag) + 2 // $tag$
+				closeIdx := strings.Index(sql[i+open:], "$"+tag+"$")
+				if closeIdx < 0 {
+					// Unterminated dollar quote: not a dollar-quote
+					// context we can trust; keep scanning so a nested
+					// comment later in the text is still caught (the
+					// parse gate rejects the unterminated quote anyway).
+					continue
+				}
+				i += open + closeIdx + len(tag) + 1
+			}
+		}
+	}
+	return false
+}
+
+// dollarTagAt parses a dollar-quote opening delimiter at sql[i] == '$':
+// "$$" (empty tag) or "$tag$" with a tag of letters, digits or underscore.
+func dollarTagAt(sql string, i int) (tag string, ok bool) {
+	j := i + 1
+	for j < len(sql) && (sql[j] == '_' || isASCIILetterOrDigit(sql[j])) {
+		j++
+	}
+	if j >= len(sql) || sql[j] != '$' {
+		return "", false
+	}
+	return sql[i+1 : j], true
+}
+
+func isASCIILetterOrDigit(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+}
+
+// isDollarIdentByte reports whether c can be part of an identifier that
+// may legally contain '$' (PostgreSQL identifiers allow $ after the
+// first character).
+func isDollarIdentByte(c byte) bool {
+	return isASCIILetterOrDigit(c) || c == '_' || c == '$'
+}
+
 // atomize tokenizes masked SQL and merges tokens with comments into a
 // position-sorted atom stream. Token text is always taken from the original
 // source so format verbs survive byte-exact.
@@ -338,6 +472,12 @@ func atomize(src, masked string) ([]atom, bool) {
 		atoms = append(atoms, atom{kind: atomComment, text: strings.TrimRight(src[s:e], "\r\n"), start: s, end: e})
 	}
 	sort.Slice(atoms, func(i, j int) bool { return atoms[i].start < atoms[j].start })
+	for i := range atoms {
+		if atoms[i].kind != atomComment || i == 0 {
+			continue
+		}
+		atoms[i].trailing = !strings.ContainsAny(src[atoms[i-1].end:atoms[i].start], "\n")
+	}
 	return atoms, true
 }
 
@@ -827,6 +967,7 @@ type layouter struct {
 	curLevel  int   // indent level of the pending line
 	lastA     *atom // last atom written on the pending line
 	last2A    *atom // atom before lastA
+	lastTokA  *atom // last token (non-comment) atom written
 	outEndsNL bool  // out ends with a newline
 	// lineOpen reports whether the pending line is a clause line that the
 	// next clause may extend (statement start, or a fresh clause line
@@ -836,6 +977,23 @@ type layouter struct {
 	// pendingBreak forces the next clause onto a fresh line (set when a
 	// frame's "(" just terminated its line, per D6).
 	pendingBreak bool
+	// lineNo is the index of the pending line: how many newlines have
+	// been written to out so far.
+	lineNo int
+	// trailMarks records where trailing comments were written inline,
+	// for the shared-column alignment post-pass.
+	trailMarks []trailMark
+}
+
+// trailMark is one inline trailing comment: the output line index, the
+// rune column where the comment text starts, and the comment text itself
+// (the post-pass verifies the line actually starts with it — multiline
+// atoms can make bookkeeping drift, and padding must never land in the
+// middle of a string literal or comment).
+type trailMark struct {
+	line int
+	col  int
+	text string
 }
 
 func render(atoms []atom, src, unit string) string {
@@ -843,7 +1001,47 @@ func render(atoms []atom, src, unit string) string {
 	l.lineOpen = true
 	l.emitBlock(atoms, 0)
 	l.flush()
-	return l.out.String()
+	return alignTrailingComments(l.out.String(), l.trailMarks)
+}
+
+// alignTrailingComments pads contiguous lines that end in a trailing
+// comment so every comment in a run starts at the same column. Padding is
+// whitespace only: the identity gate (same atom stream) is unaffected.
+// A run is skipped when the target column would exceed widthLimit, and a
+// mark is skipped when its line does not actually start with the recorded
+// comment at the recorded column (multiline-atom drift).
+func alignTrailingComments(out string, marks []trailMark) string {
+	if len(marks) == 0 {
+		return out
+	}
+	lines := strings.Split(out, "\n")
+	sort.Slice(marks, func(i, j int) bool { return marks[i].line < marks[j].line })
+	for g := 0; g < len(marks); {
+		e := g + 1
+		for e < len(marks) && marks[e].line == marks[e-1].line+1 {
+			e++
+		}
+		target := marks[g].col
+		for _, m := range marks[g:e] {
+			if m.col > target {
+				target = m.col
+			}
+		}
+		if target <= widthLimit {
+			for _, m := range marks[g:e] {
+				if m.line >= len(lines) || m.col >= target {
+					continue
+				}
+				runes := []rune(lines[m.line])
+				if m.col > len(runes) || !strings.HasPrefix(string(runes[m.col:]), m.text) {
+					continue
+				}
+				lines[m.line] = string(runes[:m.col]) + strings.Repeat(" ", target-m.col) + string(runes[m.col:])
+			}
+		}
+		g = e
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (l *layouter) flush() {
@@ -863,16 +1061,18 @@ func (l *layouter) br(level int) {
 		l.flush()
 		l.out.WriteString("\n")
 		l.outEndsNL = true
+		l.lineNo++
 	} else if !l.outEndsNL && l.out.Len() > 0 {
 		l.out.WriteString("\n")
 		l.outEndsNL = true
+		l.lineNo++
 	}
 	l.cur.Reset()
 	l.cur.WriteString(strings.Repeat(l.unit, level))
 	l.curRunes = 0
 	l.curLevel = level
 	l.curHasTok = false
-	l.lastA, l.last2A = nil, nil
+	l.lastA, l.last2A, l.lastTokA = nil, nil, nil
 	l.pendingBreak = false
 }
 
@@ -887,11 +1087,26 @@ func (l *layouter) blankLine() {
 	l.out.WriteString("\n")
 	l.out.WriteString("\n")
 	l.outEndsNL = true
+	l.lineNo += 2
 }
 
 func (l *layouter) writeRaw(s string) {
+	l.writeText(s)
+}
+
+// writeText appends s to the pending line, accounting for embedded
+// newlines (multiline block comments, string literals): lineNo advances
+// and curRunes resets to the length after the last newline.
+func (l *layouter) writeText(s string) {
 	l.cur.WriteString(s)
-	l.curRunes += utf8.RuneCountInString(s)
+	if n := strings.Count(s, "\n"); n > 0 {
+		l.lineNo += n
+		if i := strings.LastIndexByte(s, '\n'); i >= 0 {
+			l.curRunes = utf8.RuneCountInString(s[i+1:])
+		}
+	} else {
+		l.curRunes += utf8.RuneCountInString(s)
+	}
 	l.curHasTok = true
 }
 
@@ -907,12 +1122,31 @@ func (l *layouter) writeAtom(a *atom) {
 		// Never continue a "--" comment line: break first.
 		l.br(l.curLevel)
 	}
+	if l.curHasTok && isStringConst(a) && l.lastTokA != nil && isStringConst(l.lastTokA) &&
+		strings.Contains(l.src[l.lastTokA.end:a.start], "\n") {
+		// Adjacent string literals concatenate in PostgreSQL only when
+		// separated by pure whitespace containing a newline; a comment
+		// between them invalidates the query either way. Keep such pairs
+		// on different lines — the only form PostgreSQL accepts (the
+		// GoSQLX parse gate cannot see this constraint).
+		l.br(l.curLevel)
+	}
+	if a.kind == atomComment && a.trailing && l.curHasTok {
+		// Record before writing: the mark must point at the column the
+		// comment text will start at (indent + content + separator gap).
+		col := l.unitW*l.curLevel + l.curRunes
+		if needSpace(l.lastA, l.last2A, a, l.src) {
+			col++
+		}
+		l.trailMarks = append(l.trailMarks, trailMark{line: l.lineNo, col: col, text: a.text})
+	}
 	if l.curHasTok && needSpace(l.lastA, l.last2A, a, l.src) {
 		l.writeRaw(" ")
 	}
-	l.cur.WriteString(a.text)
-	l.curRunes += utf8.RuneCountInString(a.text)
-	l.curHasTok = true
+	l.writeText(a.text)
+	if a.kind == atomToken {
+		l.lastTokA = a
+	}
 	l.last2A, l.lastA = l.lastA, a
 }
 
@@ -936,10 +1170,27 @@ func (l *layouter) fitsAhead(level, flat int, first *atom) bool {
 	return level*l.unitW+l.curRunes+gap+flat <= widthLimit
 }
 
+// isStringConst reports whether the atom is a PostgreSQL string constant
+// ('...', $$...$$) — adjacent such constants concatenate when separated by
+// whitespace containing a newline.
+func isStringConst(a *atom) bool {
+	return a.ttype == models.TokenTypeSingleQuotedString ||
+		a.ttype == models.TokenTypeDollarQuotedString
+}
+
 // flatHard measures the flat single-line width (runes) of atoms and
 // reports whether the range contains a hard-break trigger: a comment or a
 // multiline args frame (at any depth).
 func (l *layouter) flatHard(atoms []atom) (int, bool) {
+	return l.flatHardEnd(atoms, true)
+}
+
+// flatHardEnd is flatHard with atEnd reporting whether the range's last
+// atom is genuinely the end of a line when emitted (a clause end). In a
+// nested range (paren content) a trailing "--" is followed by the closing
+// paren on its own line, so treating it as soft would make the width math
+// lie.
+func (l *layouter) flatHardEnd(atoms []atom, atEnd bool) (int, bool) {
 	hard := false
 	width := 0
 	var prev, prev2 *atom
@@ -947,6 +1198,20 @@ func (l *layouter) flatHard(atoms []atom) (int, bool) {
 	for i < len(atoms) {
 		a := &atoms[i]
 		if a.kind == atomComment {
+			// A trailing comment that ends the range (or a block comment,
+			// which cannot swallow what follows) rides the line: count its
+			// width instead of forcing a break. A trailing "--" mid-range
+			// stays hard: the atoms after it would land on the comment's
+			// line, and the width math would lie.
+			if a.trailing && (!strings.HasPrefix(a.text, "--") || (atEnd && i == len(atoms)-1)) {
+				if needSpace(prev, prev2, a, l.src) {
+					width++
+				}
+				width += utf8.RuneCountInString(a.text)
+				prev2, prev = prev, a
+				i++
+				continue
+			}
 			hard = true
 			prev2, prev = prev, a
 			i++
@@ -968,7 +1233,7 @@ func (l *layouter) flatHard(atoms []atom) (int, bool) {
 			if frameKindOf(inner) == frameArgs && strings.Contains(l.src[a.end:rp.start], "\n") {
 				hard = true
 			}
-			w, h := l.flatHard(inner)
+			w, h := l.flatHardEnd(inner, false)
 			if h {
 				hard = true
 			}
@@ -979,6 +1244,21 @@ func (l *layouter) flatHard(atoms []atom) (int, bool) {
 			prev2, prev = prev, rp
 			i = j + 1
 			continue
+		}
+		if isStringConst(a) {
+			// Adjacent string literals concatenate in PostgreSQL only
+			// across pure-whitespace newline; a comment between them
+			// invalidates the query either way. Keep such pairs off one
+			// line (the writeAtom guard enforces the newline; mark it
+			// hard so the fit math does not assume one line).
+			j := i - 1
+			for j >= 0 && atoms[j].kind == atomComment {
+				j--
+			}
+			if j >= 0 && isStringConst(&atoms[j]) &&
+				strings.Contains(l.src[atoms[j].end:a.start], "\n") {
+				hard = true
+			}
 		}
 		if needSpace(prev, prev2, a, l.src) {
 			width++
@@ -1041,6 +1321,10 @@ func (l *layouter) emitStmt(stmt []atom, level int) {
 	}
 	if segs[0].start > 0 {
 		l.emitExpr(stmt[:segs[0].start], level)
+		// Pre-segment atoms are leading comments: the statement keyword
+		// starts a fresh line below them (for "--" comments writeAtom's
+		// onLineComment guard does this; for block comments it does not).
+		l.lineOpen = false
 	}
 	for si := range segs {
 		l.emitClause(stmt, &segs[si], level)
@@ -1068,9 +1352,10 @@ func (l *layouter) openClause(level int) {
 }
 
 // argsFrameStart reports whether atoms begins (skipping comments) with a
-// top-level multiline args-preserve paren frame, returning the frame's
-// extent [lp, one-past-rp).
-func argsFrameStart(l *layouter, atoms []atom) (int, int, bool) {
+// top-level args-preserve paren frame, returning the frame's extent
+// [lp, one-past-rp). With requireMultiline the frame's source must span
+// lines; single-line frames are matched only for the glue+fill branch.
+func argsFrameStart(l *layouter, atoms []atom, requireMultiline bool) (int, int, bool) {
 	i := 0
 	for i < len(atoms) && atoms[i].kind == atomComment {
 		i++
@@ -1083,14 +1368,31 @@ func argsFrameStart(l *layouter, atoms []atom) (int, int, bool) {
 		return 0, 0, false
 	}
 	if frameKindOf(atoms[i+1:j]) != frameArgs ||
-		!strings.Contains(l.src[atoms[i].end:atoms[j].start], "\n") {
+		(requireMultiline && !strings.Contains(l.src[atoms[i].end:atoms[j].start], "\n")) {
 		return 0, 0, false
 	}
 	return i, j + 1, true
 }
 
+// frameHasComment reports whether any atom in the range is a comment.
+func frameHasComment(atoms []atom) bool {
+	for i := range atoms {
+		if atoms[i].kind == atomComment {
+			return true
+		}
+	}
+	return false
+}
+
 func (l *layouter) emitClause(stmt []atom, seg *clauseSeg, level int) {
 	l.settle(level)
+	if l.onLineComment() {
+		// fitsAhead refuses to append to a "--" comment line (G14); move
+		// to a fresh line so the clause is laid out on its own merits
+		// (it may still glue: e.g. OFFSET 5 below a trailing comment).
+		l.br(level)
+		l.lineOpen = true
+	}
 	kw := stmt[seg.start:seg.kwEnd]
 	rest := stmt[seg.kwEnd:seg.end]
 	flatAll, hard := l.flatHard(stmt[seg.start:seg.end])
@@ -1102,7 +1404,7 @@ func (l *layouter) emitClause(stmt []atom, seg *clauseSeg, level int) {
 		// content at level+1 and ")" at the keyword's level (D6). A
 		// comment before "(" falls back to the generic path so it is
 		// never dropped.
-		if fs, fe, ok := argsFrameStart(l, rest); ok && fs == 0 && fe == len(rest) {
+		if fs, fe, ok := argsFrameStart(l, rest, true); ok && fs == 0 && fe == len(rest) {
 			l.openClause(level)
 			l.writeInline(kw)
 			lp, rp := &rest[fs], &rest[fe-1]
@@ -1110,6 +1412,30 @@ func (l *layouter) emitClause(stmt []atom, seg *clauseSeg, level int) {
 			l.lineOpen = false
 			l.emitArgsLines(lp, rp, rest[fs+1:fe-1], level)
 			return
+		}
+		// A single-line args frame spanning the whole clause rest takes
+		// the same glue shape as the multiline branch when it overflows:
+		// pass 1 fills the items at level+1, pass 2 sees a multiline
+		// frame and re-enters the branch above (byte-identical). Frame
+		// with a comment falls back to the generic path — inline
+		// trailMark alignment is not reproducible across passes.
+		if fs, fe, ok := argsFrameStart(l, rest, false); ok && fs == 0 &&
+			fe == len(rest) && !hard && !frameHasComment(rest[fs:fe]) {
+			// Measure on the clause's own line: openClause first, so
+			// curRunes is not stale width from the previous clause.
+			l.openClause(level)
+			if !l.fitsAhead(level, flatAll, &stmt[seg.start]) {
+				l.writeInline(kw)
+				lp, rp := &rest[fs], &rest[fe-1]
+				l.writeAtom(lp)
+				l.lineOpen = false
+				items, seps := splitOn(rest[fs+1:fe-1], isComma)
+				l.emitCommaItems(items, seps, level, true)
+				l.br(level)
+				l.writeAtom(rp)
+				l.lineOpen = true
+				return
+			}
 		}
 		items, seps := splitOn(rest, isComma)
 		l.openClause(level)
@@ -1124,7 +1450,7 @@ func (l *layouter) emitClause(stmt []atom, seg *clauseSeg, level int) {
 		}
 		l.writeInline(kw)
 		if !fit {
-			l.emitCommaItems(items, seps, level)
+			l.emitCommaItems(items, seps, level, false)
 			return
 		}
 		l.writeInline(rest)
@@ -1232,12 +1558,17 @@ func (l *layouter) emitClause(stmt []atom, seg *clauseSeg, level int) {
 			baseFlat := l.flatLen(base)
 			if !baseHard && l.fitsAhead(level, baseFlat, &base[0]) {
 				l.writeInline(base)
-			} else if !baseHard && level*l.unitW+baseFlat <= widthLimit {
+			} else if level*l.unitW+baseFlat <= widthLimit {
 				// Base fits on a fresh line: move it there instead of
-				// breaking the table list.
+				// breaking the table list. Hard bases (a leading comment
+				// right after the keyword) take this branch too: pass 1
+				// may reclassify a trailing comment as leading when its
+				// line breaks, and both classifications must emit the
+				// same bytes — hence structural emitExpr, not
+				// writeInline, so comment placement is identical.
 				l.br(level)
 				l.lineOpen = true
-				l.writeInline(base)
+				l.emitExpr(base, level)
 			} else {
 				l.emitBrokenList(base, level)
 			}
@@ -1301,24 +1632,51 @@ func (l *layouter) emitClause(stmt []atom, seg *clauseSeg, level int) {
 func (l *layouter) emitBrokenList(atoms []atom, level int) {
 	items, seps := splitOn(atoms, isComma)
 	l.lineOpen = false
-	l.emitCommaItems(items, seps, level)
+	l.emitCommaItems(items, seps, level, false)
 }
 
 // emitCommaItems emits comma-separated items one per line at level+1,
 // keeping the source's commas in trailing position (never added). A comma
 // that would land on a comment line moves to the start of the next item
 // line instead — a "--" comment would swallow it.
-func (l *layouter) emitCommaItems(items [][]atom, seps []*atom, level int) {
+//
+// With fill=true (overflowing single-line args frames) items ride the
+// current line while they fit instead of forcing one-per-line; the first
+// item always starts a fresh line so pass 2 (which re-routes the now
+// multiline frame through emitArgsLines) reproduces the same bytes.
+func (l *layouter) emitCommaItems(items [][]atom, seps []*atom, level int, fill bool) {
 	l.lineOpen = false
 	deferred := false
 	for ii, item := range items {
-		l.br(level + 1)
-		if deferred {
-			l.writeRaw(",")
-			l.last2A, l.lastA = nil, seps[ii-1]
-			deferred = false
+		// A trailing comment after the separator ("bbb, -- note") rides
+		// the previous item's line; the item's own content still starts a
+		// fresh line. With a deferred comma the ride branch would drop
+		// the separator, so go through the regular branch where it is
+		// written at the top of the next item's line.
+		if len(item) > 0 && item[0].kind == atomComment && item[0].trailing && l.curHasTok && !deferred {
+			l.writeAtom(&item[0])
+			l.br(level + 1)
+			l.emitExpr(item[1:], level+1)
+		} else {
+			if fill {
+				w, h := l.flatHardEnd(item, false)
+				need := w
+				if ii < len(seps) {
+					need++ // the trailing comma rides the item's line
+				}
+				if ii == 0 || len(item) == 0 || h || !l.fitsAhead(level+1, need, &item[0]) {
+					l.br(level + 1)
+				}
+			} else {
+				l.br(level + 1)
+			}
+			if deferred {
+				l.writeRaw(",")
+				l.last2A, l.lastA = nil, seps[ii-1]
+				deferred = false
+			}
+			l.emitExpr(item, level+1)
 		}
-		l.emitExpr(item, level+1)
 		if ii < len(seps) {
 			if l.curHasTok && l.lastA != nil && l.lastA.kind == atomComment {
 				deferred = true
@@ -1523,7 +1881,7 @@ func (l *layouter) emitInsertRest(rest []atom, level int) {
 			l.lineOpen = false
 			l.writeAtom(lp)
 			items, seps := splitOn(inner, isComma)
-			l.emitCommaItems(items, seps, level)
+			l.emitCommaItems(items, seps, level, false)
 			l.br(level)
 			l.writeAtom(rp)
 			// The ")" line is extendable: ") VALUES (...)" may glue.
@@ -1632,8 +1990,12 @@ func (l *layouter) emitExpr(atoms []atom, level int) {
 		a := &atoms[i]
 		switch {
 		case a.kind == atomComment:
-			l.br(level)
-			l.writeAtom(a)
+			if a.trailing && l.curHasTok {
+				l.writeAtom(a)
+			} else {
+				l.br(level)
+				l.writeAtom(a)
+			}
 		case a.ttype == models.TokenTypeLParen:
 			j := matchParen(atoms, i)
 			if j < 0 {
@@ -1681,6 +2043,12 @@ func (l *layouter) emitFrame(f []atom, level int) {
 		l.emitBlock(inner, level+1)
 		l.br(level)
 		l.writeAtom(rp)
+		// The ")" line must not be extended by the next clause: content
+		// inside (e.g. a filled or multiline args frame) leaves
+		// lineOpen=true, and without this the main query's first clause
+		// would glue onto ")". Same-expression continuations (aliases,
+		// casts) still glue: writeAtom ignores pendingBreak.
+		l.pendingBreak = true
 		return
 	}
 	if strings.Contains(l.src[lp.end:rp.start], "\n") {
@@ -1688,8 +2056,30 @@ func (l *layouter) emitFrame(f []atom, level int) {
 		l.lineOpen = true
 		return
 	}
-	// Single-line args frame that does not fit: stay inline (documented
-	// limit — breaking would lose the author's padding).
+	// Overflowing single-line args frame: fill items onto as few lines
+	// as fit at level+1. The shape must match what emitArgsLines (pass 2
+	// re-routes the now multiline frame here) reproduces: first item on
+	// a fresh line, items at level+1, ")" at the frame level with the
+	// line left extendable. A comment inside disables fill: its inline
+	// trailMark alignment would drift between passes (pass 2 re-emits
+	// raw lines with no marks).
+	hasComment := false
+	for i := range inner {
+		if inner[i].kind == atomComment {
+			hasComment = true
+			break
+		}
+	}
+	if !hasComment {
+		items, seps := splitOn(inner, isComma)
+		l.emitCommaItems(items, seps, level, true)
+		l.br(level)
+		l.writeAtom(rp)
+		l.lineOpen = true
+		return
+	}
+	// Frame with a comment: stay inline (documented limit — breaking
+	// would lose the author's padding and comment alignment).
 	for i := 1; i < len(f); i++ {
 		l.writeAtom(&f[i])
 	}
@@ -1706,7 +2096,14 @@ func (l *layouter) emitArgsLines(lp, rp *atom, inner []atom, level int) {
 	if strings.TrimSpace(lines[0]) == "" && len(lines) > 1 {
 		start = 1 // content begins on the line after "("
 	}
+	// The common indent excludes the glued first line (content sharing
+	// the "(" line): its own leading whitespace is author style, not the
+	// alignment reference — including it made the padding normalization
+	// differ between the first and second pass (non-idempotent).
 	common := commonIndentLines(lines[start:])
+	if start == 0 && len(lines) > 1 {
+		common = commonIndentLines(lines[1:])
+	}
 	// Drop blank source lines (D8: the formatter introduces blank lines
 	// only between statements and CTE definitions).
 	end := len(lines)

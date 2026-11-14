@@ -1,6 +1,7 @@
 package processor
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -528,7 +529,7 @@ func TestG5bJoinCap(t *testing.T) {
 // LayoutWithReason end-to-end, including the ReasonUnsafe token guard.
 func TestSkipReasons(t *testing.T) {
 	// SkipString covers every reason with a non-empty message.
-	for _, r := range []SkipReason{ReasonEmpty, ReasonDDL, ReasonSQLXEscape, ReasonParse, ReasonUnsafe} {
+	for _, r := range []SkipReason{ReasonEmpty, ReasonDDL, ReasonSQLXEscape, ReasonParse, ReasonUnsafe, ReasonNestedComment} {
 		if SkipString(r) == "" {
 			t.Fatalf("SkipString(%d) is empty", r)
 		}
@@ -543,6 +544,13 @@ func TestSkipReasons(t *testing.T) {
 		{"ddl", "CREATE TABLE t (id int)", ReasonDDL},
 		{"sqlx escape", "SELECT id FROM t WHERE u = :u::::text", ReasonSQLXEscape},
 		{"invalid sql", "SELECT FROM WHERE", ReasonParse},
+		// PostgreSQL block comments nest; GoSQLX stops at the first */
+		// and treats the tail as real tokens, so such literals are skipped.
+		{"nested block comment", "SELECT 1 /* outer /* inner */ + 2 */", ReasonNestedComment},
+		{"nested tight", "SELECT 1 /*/* x */ */", ReasonNestedComment},
+		// '$' inside an identifier is not a dollar quote: the scan must
+		// not give up at an identifier like a$b$.
+		{"nested after dollar ident", "SELECT a$b$ FROM t /* x /* y */ */", ReasonNestedComment},
 	}
 	for _, tc := range cases {
 		var got SkipReason
@@ -561,9 +569,228 @@ func TestSkipReasons(t *testing.T) {
 	// the guard code compiles into the same fail() funnel as other
 	// reasons (ReasonParse above uses the same mechanism).
 
+	// Control cases: "/*" inside string literals and normal flat block
+	// comments must not trip the nested-comment gate.
+	for _, tc := range []struct{ name, sql string }{
+		{"block comment in string", "SELECT '/* not a /* comment */' FROM t"},
+		{"flat block comment", "SELECT /* hello */ a FROM t"},
+		{"comment before string", "SELECT /* a */ 'b' FROM t"},
+		{"dollar-quoted string", "SELECT $$ /* /* $$ FROM t"},
+		{"tagged dollar-quoted string", "SELECT $x$ /* /* $x$ FROM t"},
+		{"comment chars in quoted identifier", `SELECT "a/*b" FROM t`},
+		{"comment opener in line comment", "SELECT a -- /* /*\nFROM t"},
+	} {
+		var got SkipReason
+		if out, ok := LayoutWithReason(tc.sql, "", &got); !ok {
+			t.Fatalf("%s: Layout rejected literal (reason %d)", tc.name, got)
+		} else if _, ok := LayoutWithReason(out, "", &got); !ok {
+			t.Fatalf("%s: output not idempotent (reason %d)", tc.name, got)
+		}
+	}
+
 	// Plain Layout with no reason pointer: unchanged contract.
 	if _, ok := Layout("CREATE TABLE t (id int)", ""); ok {
 		t.Fatal("plain Layout must reject DDL")
+	}
+}
+
+// TestSpacedOperatorRejected pins the "< =" contract: the layout must
+// never silently join spaced operator characters into a new operator
+// ("=<", "<="), which would change the query's meaning behind every
+// gate. GoSQLX's parse gate rejects such input outright — the pinned
+// contract is ReasonParse with no output. (Direct output-based pinning
+// is impossible: the gate never lets the literal reach layout.)
+func TestSpacedOperatorRejected(t *testing.T) {
+	for _, in := range []string{
+		"SELECT a < = b FROM t",
+		"SELECT a > = b FROM t",
+		"SELECT a = > b FROM t",
+	} {
+		var r SkipReason
+		out, ok := LayoutWithReason(in, "", &r)
+		if ok || out != "" {
+			t.Fatalf("%q: spaced operator must never be re-laid (got ok=%v out=%q)", in, ok, out)
+		}
+		if r != ReasonParse {
+			t.Fatalf("%q: reason = %d (%s), want ReasonParse", in, r, SkipString(r))
+		}
+	}
+}
+
+// TestTrailingComments pins the trailing-comment behavior: a comment with
+// code before it on the same source line ("trailing") rides that line
+// instead of forcing a break, and contiguous lines with trailing comments
+// are padded to one shared comment column. Leading comments (own source
+// line) keep the old own-line behavior.
+func TestTrailingComments(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "trailing comment rides its list item",
+			in:   "SELECT a, b, c, d, e -- last one\nFROM t",
+			want: "SELECT\n" +
+				"\ta,\n" +
+				"\tb,\n" +
+				"\tc,\n" +
+				"\td,\n" +
+				"\te -- last one\n" +
+				"FROM t",
+		},
+		{
+			name: "trailing block comment keeps clause inline",
+			in:   "SELECT a, b /* note */ FROM t",
+			want: "SELECT a, b /* note */ FROM t",
+		},
+		{
+			name: "trailing comment after comma rides previous item's line",
+			in:   "SELECT aaa, bbb, -- note\nccc, ddd FROM t",
+			want: "SELECT\n" +
+				"\taaa,\n" +
+				"\tbbb, -- note\n" +
+				"\tccc,\n" +
+				"\tddd\n" +
+				"FROM t",
+		},
+		{
+			name: "where chain with trailing comments rides and aligns",
+			in:   "SELECT 1 FROM t\nWHERE aaaa = 1 -- first\nAND bbbb = 2 -- second",
+			want: "SELECT 1 FROM t\n" +
+				"WHERE aaaa = 1 -- first\n" +
+				"\tAND bbbb = 2  -- second",
+		},
+	}
+	for _, tc := range cases {
+		got, ok := Layout(tc.in, "")
+		if !ok {
+			t.Fatalf("%s: Layout rejected literal", tc.name)
+		}
+		if got != tc.want {
+			t.Fatalf("%s:\n--- got ---\n%s\n--- want ---\n%s", tc.name, got, tc.want)
+		}
+		again, ok := Layout(got, "")
+		if !ok {
+			t.Fatalf("%s: re-layout rejected its own output", tc.name)
+		}
+		if again != got {
+			t.Fatalf("%s: not idempotent\n--- second ---\n%s\n--- first ---\n%s", tc.name, again, got)
+		}
+	}
+
+	// Multiline atoms (block comments, string literals with embedded
+	// newlines) advance the line counter: alignment marks must stay on
+	// the comment's real line, never inside a string literal.
+	multi := []string{
+		"SELECT /* x\ny */ a, -- c1\n b -- c2\nFROM t",
+		"SELECT 'p\nq' AS s, -- c1\n b -- c2\nFROM t",
+		"SELECT f(a -- c\n) FROM t",
+		"SELECT " + strings.Repeat("long_column_name_here, ", 4) + "last_item -- a very long trailing comment that pushes far past the limit\nFROM t",
+		// Item ending in a comment (comma deferred) followed by an item
+		// starting with a trailing comment: the ride branch must not eat
+		// the deferred comma — previously this literal was silently
+		// rejected (ReasonParse) instead of formatted.
+		"SELECT b /* x */, /* y */ c, d, e, f FROM t",
+	}
+	for _, in := range multi {
+		got, ok := Layout(in, "")
+		if !ok {
+			t.Fatalf("multiline atom case rejected: %q", in)
+		}
+		again, ok := Layout(got, "")
+		if !ok || again != got {
+			t.Fatalf("multiline atom case not idempotent\n--- in ---\n%s\n--- once ---\n%s\n--- twice ---\n%s", in, got, again)
+		}
+		for _, line := range strings.Split(got, "\n") {
+			if strings.Contains(line, "'p") && strings.Contains(line, "  ") {
+				t.Fatalf("padding leaked into a string literal line:\n%s", got)
+			}
+		}
+	}
+
+	// A run of adjacent >80-column lines with trailing comments must NOT
+	// be padded (the shared column would exceed widthLimit): each comment
+	// keeps its single separator space. Guards the target <= widthLimit
+	// branch of alignTrailingComments.
+	long := "SELECT 1 FROM t\n" +
+		"WHERE " + strings.Repeat("x", 70) + " >= 100000 -- first\n" +
+		"AND " + strings.Repeat("y", 70) + " <= 200000 -- second"
+	got, ok := Layout(long, "")
+	if !ok {
+		t.Fatal("over-limit run case rejected")
+	}
+	again, ok := Layout(got, "")
+	if !ok || again != got {
+		t.Fatalf("over-limit run case not idempotent\n--- once ---\n%s\n--- twice ---\n%s", got, again)
+	}
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasSuffix(line, "  -- first") || strings.HasSuffix(line, "  -- second") {
+			t.Fatalf("comments aligned past the 80-column limit:\n%s", got)
+		}
+	}
+}
+
+// TestAdjacentStringLiterals pins a PostgreSQL whitespace constraint the
+// parse gate cannot see: adjacent string literals concatenate only when
+// separated by pure whitespace containing a newline, so the layout must
+// keep them off one line. With a comment between the literals the input
+// is invalid PostgreSQL either way; the layout still keeps the literals
+// on different lines (the closer-to-valid form).
+func TestAdjacentStringLiterals(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       string
+		lit1     string
+		lit2     string
+		sameLine bool // false: must land on different lines
+	}{
+		{"plain", "SELECT 'a'\n'b' FROM t", "'a'", "'b'", false},
+		{"block comment between", "SELECT 'x' /* c */\n'y' FROM t", "'x'", "'y'", false},
+		{"line comment between", "SELECT 'x' -- c\n'y' FROM t", "'x'", "'y'", false},
+		{"inline pair stays inline", "SELECT 'a', 'b' FROM t", "'a'", "'b'", true},
+	}
+	for _, tc := range cases {
+		out, ok := Layout(tc.in, "")
+		if !ok {
+			t.Fatalf("%s: Layout rejected input", tc.name)
+		}
+		for _, line := range strings.Split(out, "\n") {
+			both := strings.Contains(line, tc.lit1) && strings.Contains(line, tc.lit2)
+			if both && !tc.sameLine {
+				t.Fatalf("%s: literals must be on different lines (PostgreSQL concatenation), got:\n%s", tc.name, out)
+			}
+		}
+		if tc.sameLine {
+			found := false
+			for _, line := range strings.Split(out, "\n") {
+				if strings.Contains(line, tc.lit1) && strings.Contains(line, tc.lit2) {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("%s: inline pair was broken apart:\n%s", tc.name, out)
+			}
+		}
+		again, ok := Layout(out, "")
+		if !ok || again != out {
+			t.Fatalf("%s: not idempotent\n--- once ---\n%s\n--- twice ---\n%s", tc.name, out, again)
+		}
+	}
+}
+
+// TestGluedArgsFrameIdempotent pins the fuzz-found regression: a multiline
+// args frame with content glued to the "(" line must be a fixed point —
+// the padding normalization used to differ between passes.
+func TestGluedArgsFrameIdempotent(t *testing.T) {
+	in := "SEt( 0\n  ())"
+	out, ok := Layout(in, "")
+	if !ok {
+		t.Fatal("Layout rejected glued args frame")
+	}
+	again, ok := Layout(out, "")
+	if !ok || again != out {
+		t.Fatalf("glued args frame not idempotent\n--- once ---\n%q\n--- twice ---\n%q", out, again)
 	}
 }
 
@@ -958,10 +1185,9 @@ func TestLayoutIdentifierParenSpacing(t *testing.T) {
 // on its own line at the item level.
 func TestLayoutCommentsOwnLine(t *testing.T) {
 	in := "SELECT a -- note\nFROM t"
-	want := "SELECT\n" +
-		"\ta\n" +
-		"\t-- note\n" +
-		"FROM t"
+	// A trailing comment (code before it on the same source line) rides
+	// its line; a leading comment keeps its own line (TestTrailingComments).
+	want := "SELECT a -- note\nFROM t"
 	got, ok := Layout(in, "")
 	if !ok {
 		t.Fatal("Layout rejected comment input")
@@ -1135,8 +1361,9 @@ func TestBindNameLiteralSkipped(t *testing.T) {
 // TestKnownLimits documents narrow, deliberate exceptions to the rules:
 //   - a broken list keeps only the commas the source had; no comma is
 //     ever added after the last item (whitespace/no-new-tokens invariant);
-//   - a single-line args frame that does not fit stays inline (breaking
-//     it would lose the author's alignment padding);
+//   - an overflowing single-line args frame fills (one item per line
+//     remains only for a frame containing a comment: its inline trailMark
+//     alignment is not reproducible across passes);
 //   - the fit check measures the level indent and the current line, not
 //     the processor-applied base indent.
 func TestKnownLimits(t *testing.T) {
@@ -1149,15 +1376,121 @@ func TestKnownLimits(t *testing.T) {
 	if strings.Contains(got, "zeta,") {
 		t.Fatalf("a comma must never be added after the last item:\n%s", got)
 	}
-	// Single-line overflowing args frame stays inline.
+	// Single-line overflowing args frame with two long args fills: each
+	// arg lands on its own line at level+1, ")" returns to the frame
+	// level, and the result is a fixed point (pass 2 re-routes the frame
+	// through emitArgsLines and must reproduce the same bytes).
 	long := strings.Repeat("arg", 40)
 	in2 := "SELECT fn(" + long + ", " + long + ") FROM t"
 	got2, ok := Layout(in2, "")
 	if !ok {
 		t.Fatal("Layout rejected long args input")
 	}
-	if !strings.Contains(got2, "fn("+long+", "+long+")") {
-		t.Fatalf("single-line args frame must stay inline:\n%s", got2)
+	if strings.Contains(got2, long+", "+long) {
+		t.Fatalf("overflowing args frame must fill, not stay inline:\n%s", got2)
+	}
+	again2, ok := Layout(got2, "")
+	if !ok || again2 != got2 {
+		t.Fatalf("args frame fill not idempotent\n--- once ---\n%s\n--- twice ---\n%s", got2, again2)
+	}
+	// A single-line args frame containing a comment stays inline: pass 2
+	// would re-emit it through emitArgsLines, whose raw lines carry no
+	// trailMarks, and comment alignment would drift between passes.
+	in3 := "SELECT fn(" + long + ", /* note */ " + long + ") FROM t"
+	got3, ok := Layout(in3, "")
+	if !ok {
+		t.Fatal("Layout rejected comment args input")
+	}
+	if !strings.Contains(got3, "fn("+long+", /* note */ "+long+")") {
+		t.Fatalf("args frame with a comment must stay inline:\n%s", got3)
+	}
+}
+
+// TestArgsFrameFill pins Wadler-style fill for overflowing single-line
+// args frames: items ride the current line while they fit, otherwise a
+// fresh line at level+1; the first item always starts a new line (the
+// shape emitArgsLines reproduces on pass 2); ")" returns to the frame's
+// level with the line left extendable (") FROM t" glues on both passes).
+func TestArgsFrameFill(t *testing.T) {
+	// Many short args: two args per line would fit; fill packs as many
+	// as fit under the 80-column limit per line.
+	var b strings.Builder
+	b.WriteString("SELECT fn(")
+	for i := 0; i < 24; i++ {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(fmt.Sprintf("arg%02d", i))
+	}
+	b.WriteString(") FROM t")
+	got, ok := Layout(b.String(), "")
+	if !ok {
+		t.Fatal("Layout rejected many-short-args input")
+	}
+	if !strings.Contains(got, "(\n") {
+		t.Fatalf("overflowing args frame must break:\n%s", got)
+	}
+	again, ok := Layout(got, "")
+	if !ok || again != got {
+		t.Fatalf("fill not idempotent\n--- once ---\n%s\n--- twice ---\n%s", got, again)
+	}
+	if !sameTokenStreams(rawAtoms(b.String()), rawAtoms(got)) {
+		t.Fatal("token stream changed")
+	}
+
+	// Nested overflow: the inner frame fills inside the outer one.
+	inner := strings.Repeat("x", 70)
+	in2 := "SELECT wrap(aa, fn(" + inner + ", " + inner + ")) FROM t"
+	got2, ok := Layout(in2, "")
+	if !ok {
+		t.Fatal("Layout rejected nested args input")
+	}
+	if strings.Contains(got2, inner+", "+inner) {
+		t.Fatalf("nested overflowing frame must fill:\n%s", got2)
+	}
+	again2, ok := Layout(got2, "")
+	if !ok || again2 != got2 {
+		t.Fatalf("nested fill not idempotent\n--- once ---\n%s\n--- twice ---\n%s", got2, again2)
+	}
+
+	// An item ending exactly at column 80 must not ride the previous
+	// line (the fit check counts its trailing comma). An item whose own
+	// width leaves no room for the comma may overhang by exactly that
+	// comma — same class as an unbreakable-token overhang.
+	wide := strings.Repeat("x", 79)
+	in3 := "SELECT (" + wide + ", b, c, d) FROM t"
+	got3, ok := Layout(in3, "")
+	if !ok {
+		t.Fatal("Layout rejected wide-first-arg input")
+	}
+	for i, ln := range strings.Split(got3, "\n") {
+		n := len([]rune(strings.TrimSuffix(ln, ",")))
+		if n > 80 {
+			t.Fatalf("line %d is %d columns (> 80): %q", i+1, n, ln)
+		}
+	}
+	again3, ok := Layout(got3, "")
+	if !ok || again3 != got3 {
+		t.Fatalf("wide-arg fill not idempotent\n--- once ---\n%s\n--- twice ---\n%s", got3, again3)
+	}
+
+	// A short clause frame must be measured on its own fresh line, not
+	// on the previous clause's stale full line (lineOpen=false,
+	// curRunes leftover): the frame fits inline on the fresh line the
+	// clause opens. Falls in the regression window found by brute force
+	// (item width 74 at level+1 leaves the line at 74 columns).
+	item := strings.Repeat("w", 74)
+	in4 := "SELECT a, " + item + " ORDER BY (x, y)"
+	got4, ok := Layout(in4, "")
+	if !ok {
+		t.Fatal("Layout rejected stale-line frame input")
+	}
+	if !strings.Contains(got4, "ORDER BY (x, y)") {
+		t.Fatalf("short clause frame must stay inline:\n%s", got4)
+	}
+	again4, ok := Layout(got4, "")
+	if !ok || again4 != got4 {
+		t.Fatalf("stale-line frame not idempotent\n--- once ---\n%s\n--- twice ---\n%s", got4, again4)
 	}
 }
 

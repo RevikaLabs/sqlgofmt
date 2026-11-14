@@ -48,6 +48,12 @@ A raw string literal is formatted only when **all** of the following hold:
   them for parsing and emits them byte-exact;
 - it contains no `::::` run of colons (sqlx escapes named parameters by
   doubling colons — such literals are skipped);
+- it contains no nested block comment (`/* /* */ */`): PostgreSQL nests
+  block comments, the tokenizer does not, so the nested comment's tail
+  would be re-tokenized as SQL code (`ReasonNestedComment`). The check
+  runs for every dialect — MySQL/ClickHouse block comments do not nest,
+  so such literals may be skipped unnecessarily, which is the safe
+  direction;
 - it is not preceded (same or previous line) by a `//sqlgofmt:ignore` comment;
 - it starts (after trimming, case-insensitive) with a DML/procedural SQL
   keyword: `SELECT, INSERT, UPDATE, DELETE, WITH, BEGIN, COMMIT, ROLLBACK,
@@ -86,8 +92,9 @@ count only — never from source newlines: a list (SELECT items, SET
 assignments, RETURNING, GROUP BY, ORDER BY, VALUES tuples, ON conditions)
 stays inline if it fits in 80 columns at its level **and** has at most 4
 top-level items; otherwise the keyword sits alone and items go one per line
-at the next level with trailing commas. A comment or a multiline
-function-argument frame inside a group always breaks it.
+at the next level with trailing commas. A **leading** comment or a multiline
+function-argument frame inside a group always breaks it (a trailing comment
+does not — see the comments rule below).
 
 One documented exception to trailing commas: when an item is followed by a
 `--` comment, the comma moves to the start of the next item's line (a
@@ -119,6 +126,13 @@ trailing comma after a `--` comment would be swallowed by it).
 - multiline function-argument frames (e.g. `json_build_object(...)`) keep
   their source line structure and alignment padding, re-indented one level
   deeper; a multiline INSERT column list keeps its source line structure;
+- an overflowing single-line function-argument frame fills: items ride the
+  line while they fit, otherwise a fresh line at the next level, `)` at the
+  frame's level; a frame containing a comment stays inline (comment
+  alignment is not reproducible across passes); when such a frame spans
+  the whole clause rest and starts right after the keyword (`VALUES (`,
+  bare `(`), `(` glues to the keyword line and `)` returns to the
+  keyword's level, extendable like any `)` line;
 - `CASE`: `WHEN <cond> THEN <result>` on one line per WHEN when the
   WHEN-line fits; a too-wide WHEN breaks at its `AND`s (line start at the
   CASE level + 1), `THEN` on its own line; `END` sits at the CASE's level;
@@ -127,7 +141,15 @@ trailing comma after a `--` comment would be swallowed by it).
   own line (the `DO` action glued to the conflict target);
 - blank lines appear only between statements (after `;`) and between CTE
   definitions (after each `name AS (...),`);
-- comments always sit on their own line, at the indent of their slot;
+- comments: a **leading** comment (no code before it on its source line)
+  sits on its own line, at the indent of its slot; a **trailing** comment
+  (code precedes it on the same line) rides that code's line instead of
+  forcing a break — a trailing `--` breaks hard when it is not the last
+  atom of its clause/range, and always inside a parenthesized range (the
+  closing `)` would land on the comment's line and be swallowed), and
+  contiguous lines ending in trailing comments are
+  padded so all their comments start at one shared column (skipped when
+  the shared column would exceed the 80-column limit);
 - between a bare identifier and `(` the source spacing is preserved (a
   table name and a function call are indistinguishable without parsing);
 - the literal's original indentation is re-applied to every formatted line
@@ -149,6 +171,31 @@ const q = `SELECT u.id, u.email FROM users u LEFT JOIN orders o ON o.user_id = u
 	ORDER BY u.email LIMIT 10`
 ```
 
+## Testing
+
+The safety net has three layers:
+
+- **Corpus** (`testdata/corpus/`): Go files whose SQL literals are
+  sqlgofmt's own canonical output, reviewed before being committed.
+  `TestCorpusRoundTrip` runs every fixture through the formatter and
+  requires a byte-identical result — an idempotency/regression guard: a
+  change that alters output for any covered construct trips a fixture
+  immediately. Regenerate fixtures with
+  `go run ./cmd/sqlgofmt -w testdata/corpus/*.go`.
+- **Fuzzer** (`FuzzLayout`): Go native fuzzing seeded from the corpus.
+  Properties: a skipped literal never produces output; a formatted
+  literal is a fixed point (`Layout(Layout(x)) == Layout(x)`) and its
+  token stream is unchanged. Run a campaign with
+  `go test ./internal/processor/ -fuzz FuzzLayout -fuzztime 90s`.
+- **Oracle** (behind the `pgquery` build tag): the real PostgreSQL parser
+  (`pg_query_go`) compares the parse trees of input and output — with
+  source Location fields stripped — proving formatting never changes a
+  query's meaning, which the GoSQLX-based token gate cannot fully see.
+  This caught, and now pins, the adjacent-string-literals rule
+  (`'a'\n'b'` concatenates only across a newline). Requires cgo
+  (~minutes on first build); `go install` stays cgo-free:
+  `go test -tags pgquery ./internal/processor/ -run TestOracle`.
+
 ## Opt-out
 
 To exclude a single literal, put a comment with `sqlgofmt:ignore` on the
@@ -159,3 +206,27 @@ same line or directly above it:
 const q = `
 select * from t`
 ```
+
+## Inspiration
+
+sqlgofmt borrows several ideas from
+[dimitri/sqlfmt](https://github.com/dimitri/sqlfmt), Dimitri Fontaine's
+PostgreSQL-focused SQL formatter:
+
+- **Comments as metadata** — a comment rides the code line it trailed in the
+  source instead of forcing a break, and neighbouring lines whose comments
+  all trail are padded to one shared comment column (sqlfmt's
+  comment-attachment, minus the river style itself);
+- **Fill for argument lists** — an overflowing single-line argument frame
+  packs items onto as few lines as fit (Wadler-style fill, sqlfmt's group
+  model) instead of staying inline forever;
+- **Testing discipline** — a reviewed corpus of canonical fixtures, a
+  property-based fuzzer, and a real-parser oracle: sqlfmt verifies output
+  with `pg_query` fingerprints; we compare full parse trees via
+  `pg_query.Parse` behind the `pgquery` build tag.
+
+Ideas considered and deliberately left out: the river layout (padding every
+line to a shared widest prefix fights the Go file's own re-indentation of
+the literal), a full Doc IR (the in-place `fitsAhead`/break machinery
+already implements the fill pattern), and sqlfmt's diff/explain tooling.
+

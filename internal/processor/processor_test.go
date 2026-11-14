@@ -21,6 +21,25 @@ func TestProcess(t *testing.T) {
 		wantIdempotent bool
 	}{
 		{
+			name: "literal starting with a line comment is formatted",
+			src: "package p\n\n" +
+				"const q = `-- fetch all active workspaces\n" +
+				"-- ordered by creation\n" +
+				"select id, name from workspaces where active = true order by created_at`\n",
+			wantChanged:    true,
+			wantSubstr:     []string{"-- fetch all active workspaces\n", "-- ordered by creation\n", "SELECT id, name FROM workspaces WHERE active = TRUE ORDER BY created_at"},
+			wantIdempotent: true,
+		},
+		{
+			name: "literal starting with a block comment is formatted",
+			src: "package p\n\n" +
+				"const q = `/* streaming replicas only */\n" +
+				"select host, port from nodes where kind = 'stream'`\n",
+			wantChanged:    true,
+			wantSubstr:     []string{"/* streaming replicas only */\n", "SELECT host, port FROM nodes WHERE kind = 'stream'"},
+			wantIdempotent: true,
+		},
+		{
 			name: "const select fitting one line stays one line",
 			src: "package p\n\n" +
 				"const q = `\n" +
