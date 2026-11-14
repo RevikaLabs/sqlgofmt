@@ -126,6 +126,13 @@ trailing comma after a `--` comment would be swallowed by it).
 - multiline function-argument frames (e.g. `json_build_object(...)`) keep
   their source line structure and alignment padding, re-indented one level
   deeper; a multiline INSERT column list keeps its source line structure;
+- an overflowing single-line function-argument frame fills: items ride the
+  line while they fit, otherwise a fresh line at the next level, `)` at the
+  frame's level; a frame containing a comment stays inline (comment
+  alignment is not reproducible across passes); when such a frame spans
+  the whole clause rest and starts right after the keyword (`VALUES (`,
+  bare `(`), `(` glues to the keyword line and `)` returns to the
+  keyword's level, extendable like any `)` line;
 - `CASE`: `WHEN <cond> THEN <result>` on one line per WHEN when the
   WHEN-line fits; a too-wide WHEN breaks at its `AND`s (line start at the
   CASE level + 1), `THEN` on its own line; `END` sits at the CASE's level;

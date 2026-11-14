@@ -1352,9 +1352,10 @@ func (l *layouter) openClause(level int) {
 }
 
 // argsFrameStart reports whether atoms begins (skipping comments) with a
-// top-level multiline args-preserve paren frame, returning the frame's
-// extent [lp, one-past-rp).
-func argsFrameStart(l *layouter, atoms []atom) (int, int, bool) {
+// top-level args-preserve paren frame, returning the frame's extent
+// [lp, one-past-rp). With requireMultiline the frame's source must span
+// lines; single-line frames are matched only for the glue+fill branch.
+func argsFrameStart(l *layouter, atoms []atom, requireMultiline bool) (int, int, bool) {
 	i := 0
 	for i < len(atoms) && atoms[i].kind == atomComment {
 		i++
@@ -1367,10 +1368,20 @@ func argsFrameStart(l *layouter, atoms []atom) (int, int, bool) {
 		return 0, 0, false
 	}
 	if frameKindOf(atoms[i+1:j]) != frameArgs ||
-		!strings.Contains(l.src[atoms[i].end:atoms[j].start], "\n") {
+		(requireMultiline && !strings.Contains(l.src[atoms[i].end:atoms[j].start], "\n")) {
 		return 0, 0, false
 	}
 	return i, j + 1, true
+}
+
+// frameHasComment reports whether any atom in the range is a comment.
+func frameHasComment(atoms []atom) bool {
+	for i := range atoms {
+		if atoms[i].kind == atomComment {
+			return true
+		}
+	}
+	return false
 }
 
 func (l *layouter) emitClause(stmt []atom, seg *clauseSeg, level int) {
@@ -1393,7 +1404,7 @@ func (l *layouter) emitClause(stmt []atom, seg *clauseSeg, level int) {
 		// content at level+1 and ")" at the keyword's level (D6). A
 		// comment before "(" falls back to the generic path so it is
 		// never dropped.
-		if fs, fe, ok := argsFrameStart(l, rest); ok && fs == 0 && fe == len(rest) {
+		if fs, fe, ok := argsFrameStart(l, rest, true); ok && fs == 0 && fe == len(rest) {
 			l.openClause(level)
 			l.writeInline(kw)
 			lp, rp := &rest[fs], &rest[fe-1]
@@ -1401,6 +1412,30 @@ func (l *layouter) emitClause(stmt []atom, seg *clauseSeg, level int) {
 			l.lineOpen = false
 			l.emitArgsLines(lp, rp, rest[fs+1:fe-1], level)
 			return
+		}
+		// A single-line args frame spanning the whole clause rest takes
+		// the same glue shape as the multiline branch when it overflows:
+		// pass 1 fills the items at level+1, pass 2 sees a multiline
+		// frame and re-enters the branch above (byte-identical). Frame
+		// with a comment falls back to the generic path — inline
+		// trailMark alignment is not reproducible across passes.
+		if fs, fe, ok := argsFrameStart(l, rest, false); ok && fs == 0 &&
+			fe == len(rest) && !hard && !frameHasComment(rest[fs:fe]) {
+			// Measure on the clause's own line: openClause first, so
+			// curRunes is not stale width from the previous clause.
+			l.openClause(level)
+			if !l.fitsAhead(level, flatAll, &stmt[seg.start]) {
+				l.writeInline(kw)
+				lp, rp := &rest[fs], &rest[fe-1]
+				l.writeAtom(lp)
+				l.lineOpen = false
+				items, seps := splitOn(rest[fs+1:fe-1], isComma)
+				l.emitCommaItems(items, seps, level, true)
+				l.br(level)
+				l.writeAtom(rp)
+				l.lineOpen = true
+				return
+			}
 		}
 		items, seps := splitOn(rest, isComma)
 		l.openClause(level)
@@ -1415,7 +1450,7 @@ func (l *layouter) emitClause(stmt []atom, seg *clauseSeg, level int) {
 		}
 		l.writeInline(kw)
 		if !fit {
-			l.emitCommaItems(items, seps, level)
+			l.emitCommaItems(items, seps, level, false)
 			return
 		}
 		l.writeInline(rest)
@@ -1523,12 +1558,17 @@ func (l *layouter) emitClause(stmt []atom, seg *clauseSeg, level int) {
 			baseFlat := l.flatLen(base)
 			if !baseHard && l.fitsAhead(level, baseFlat, &base[0]) {
 				l.writeInline(base)
-			} else if !baseHard && level*l.unitW+baseFlat <= widthLimit {
+			} else if level*l.unitW+baseFlat <= widthLimit {
 				// Base fits on a fresh line: move it there instead of
-				// breaking the table list.
+				// breaking the table list. Hard bases (a leading comment
+				// right after the keyword) take this branch too: pass 1
+				// may reclassify a trailing comment as leading when its
+				// line breaks, and both classifications must emit the
+				// same bytes — hence structural emitExpr, not
+				// writeInline, so comment placement is identical.
 				l.br(level)
 				l.lineOpen = true
-				l.writeInline(base)
+				l.emitExpr(base, level)
 			} else {
 				l.emitBrokenList(base, level)
 			}
@@ -1592,14 +1632,19 @@ func (l *layouter) emitClause(stmt []atom, seg *clauseSeg, level int) {
 func (l *layouter) emitBrokenList(atoms []atom, level int) {
 	items, seps := splitOn(atoms, isComma)
 	l.lineOpen = false
-	l.emitCommaItems(items, seps, level)
+	l.emitCommaItems(items, seps, level, false)
 }
 
 // emitCommaItems emits comma-separated items one per line at level+1,
 // keeping the source's commas in trailing position (never added). A comma
 // that would land on a comment line moves to the start of the next item
 // line instead — a "--" comment would swallow it.
-func (l *layouter) emitCommaItems(items [][]atom, seps []*atom, level int) {
+//
+// With fill=true (overflowing single-line args frames) items ride the
+// current line while they fit instead of forcing one-per-line; the first
+// item always starts a fresh line so pass 2 (which re-routes the now
+// multiline frame through emitArgsLines) reproduces the same bytes.
+func (l *layouter) emitCommaItems(items [][]atom, seps []*atom, level int, fill bool) {
 	l.lineOpen = false
 	deferred := false
 	for ii, item := range items {
@@ -1613,7 +1658,18 @@ func (l *layouter) emitCommaItems(items [][]atom, seps []*atom, level int) {
 			l.br(level + 1)
 			l.emitExpr(item[1:], level+1)
 		} else {
-			l.br(level + 1)
+			if fill {
+				w, h := l.flatHardEnd(item, false)
+				need := w
+				if ii < len(seps) {
+					need++ // the trailing comma rides the item's line
+				}
+				if ii == 0 || len(item) == 0 || h || !l.fitsAhead(level+1, need, &item[0]) {
+					l.br(level + 1)
+				}
+			} else {
+				l.br(level + 1)
+			}
 			if deferred {
 				l.writeRaw(",")
 				l.last2A, l.lastA = nil, seps[ii-1]
@@ -1825,7 +1881,7 @@ func (l *layouter) emitInsertRest(rest []atom, level int) {
 			l.lineOpen = false
 			l.writeAtom(lp)
 			items, seps := splitOn(inner, isComma)
-			l.emitCommaItems(items, seps, level)
+			l.emitCommaItems(items, seps, level, false)
 			l.br(level)
 			l.writeAtom(rp)
 			// The ")" line is extendable: ") VALUES (...)" may glue.
@@ -1987,6 +2043,12 @@ func (l *layouter) emitFrame(f []atom, level int) {
 		l.emitBlock(inner, level+1)
 		l.br(level)
 		l.writeAtom(rp)
+		// The ")" line must not be extended by the next clause: content
+		// inside (e.g. a filled or multiline args frame) leaves
+		// lineOpen=true, and without this the main query's first clause
+		// would glue onto ")". Same-expression continuations (aliases,
+		// casts) still glue: writeAtom ignores pendingBreak.
+		l.pendingBreak = true
 		return
 	}
 	if strings.Contains(l.src[lp.end:rp.start], "\n") {
@@ -1994,8 +2056,30 @@ func (l *layouter) emitFrame(f []atom, level int) {
 		l.lineOpen = true
 		return
 	}
-	// Single-line args frame that does not fit: stay inline (documented
-	// limit — breaking would lose the author's padding).
+	// Overflowing single-line args frame: fill items onto as few lines
+	// as fit at level+1. The shape must match what emitArgsLines (pass 2
+	// re-routes the now multiline frame here) reproduces: first item on
+	// a fresh line, items at level+1, ")" at the frame level with the
+	// line left extendable. A comment inside disables fill: its inline
+	// trailMark alignment would drift between passes (pass 2 re-emits
+	// raw lines with no marks).
+	hasComment := false
+	for i := range inner {
+		if inner[i].kind == atomComment {
+			hasComment = true
+			break
+		}
+	}
+	if !hasComment {
+		items, seps := splitOn(inner, isComma)
+		l.emitCommaItems(items, seps, level, true)
+		l.br(level)
+		l.writeAtom(rp)
+		l.lineOpen = true
+		return
+	}
+	// Frame with a comment: stay inline (documented limit — breaking
+	// would lose the author's padding and comment alignment).
 	for i := 1; i < len(f); i++ {
 		l.writeAtom(&f[i])
 	}

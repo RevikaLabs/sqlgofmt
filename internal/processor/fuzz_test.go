@@ -51,6 +51,12 @@ func FuzzLayout(f *testing.F) {
 	// differed between passes (non-idempotent).
 	f.Add("SEt( 0\n  ())")
 	f.Add("SEt( 0\n  (()))")
+	// Fuzz-found regression: a trailing comment reclassified as leading
+	// when its line broke made pass 2 take a different branch in clFrom.
+	f.Add("SET FROM/*000000000000000000000000000000000000000000000000000000000000000000000*/''")
+	// Fuzz-found regression: an empty item after a comma panicked the
+	// fill branch (index out of range on &item[0]).
+	f.Add("SET(;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;, )")
 
 	f.Fuzz(func(t *testing.T, sql string) {
 		var r SkipReason

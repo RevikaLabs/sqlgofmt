@@ -18,7 +18,9 @@ const q3 = `/*
 	 */
 	WITH days AS (
 		SELECT
-			generate_series($1::date, $1::date + INTERVAL '1 month - 1 day', INTERVAL '1 day')::date AS day
+			generate_series(
+				$1::date, $1::date + INTERVAL '1 month - 1 day', INTERVAL '1 day'
+			)::date AS day
 	)
 	SELECT d.day, f.event FROM days d LEFT JOIN factbook f ON f.day = d.day`
 

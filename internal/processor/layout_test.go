@@ -1,6 +1,7 @@
 package processor
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -1360,8 +1361,9 @@ func TestBindNameLiteralSkipped(t *testing.T) {
 // TestKnownLimits documents narrow, deliberate exceptions to the rules:
 //   - a broken list keeps only the commas the source had; no comma is
 //     ever added after the last item (whitespace/no-new-tokens invariant);
-//   - a single-line args frame that does not fit stays inline (breaking
-//     it would lose the author's alignment padding);
+//   - an overflowing single-line args frame fills (one item per line
+//     remains only for a frame containing a comment: its inline trailMark
+//     alignment is not reproducible across passes);
 //   - the fit check measures the level indent and the current line, not
 //     the processor-applied base indent.
 func TestKnownLimits(t *testing.T) {
@@ -1374,15 +1376,121 @@ func TestKnownLimits(t *testing.T) {
 	if strings.Contains(got, "zeta,") {
 		t.Fatalf("a comma must never be added after the last item:\n%s", got)
 	}
-	// Single-line overflowing args frame stays inline.
+	// Single-line overflowing args frame with two long args fills: each
+	// arg lands on its own line at level+1, ")" returns to the frame
+	// level, and the result is a fixed point (pass 2 re-routes the frame
+	// through emitArgsLines and must reproduce the same bytes).
 	long := strings.Repeat("arg", 40)
 	in2 := "SELECT fn(" + long + ", " + long + ") FROM t"
 	got2, ok := Layout(in2, "")
 	if !ok {
 		t.Fatal("Layout rejected long args input")
 	}
-	if !strings.Contains(got2, "fn("+long+", "+long+")") {
-		t.Fatalf("single-line args frame must stay inline:\n%s", got2)
+	if strings.Contains(got2, long+", "+long) {
+		t.Fatalf("overflowing args frame must fill, not stay inline:\n%s", got2)
+	}
+	again2, ok := Layout(got2, "")
+	if !ok || again2 != got2 {
+		t.Fatalf("args frame fill not idempotent\n--- once ---\n%s\n--- twice ---\n%s", got2, again2)
+	}
+	// A single-line args frame containing a comment stays inline: pass 2
+	// would re-emit it through emitArgsLines, whose raw lines carry no
+	// trailMarks, and comment alignment would drift between passes.
+	in3 := "SELECT fn(" + long + ", /* note */ " + long + ") FROM t"
+	got3, ok := Layout(in3, "")
+	if !ok {
+		t.Fatal("Layout rejected comment args input")
+	}
+	if !strings.Contains(got3, "fn("+long+", /* note */ "+long+")") {
+		t.Fatalf("args frame with a comment must stay inline:\n%s", got3)
+	}
+}
+
+// TestArgsFrameFill pins Wadler-style fill for overflowing single-line
+// args frames: items ride the current line while they fit, otherwise a
+// fresh line at level+1; the first item always starts a new line (the
+// shape emitArgsLines reproduces on pass 2); ")" returns to the frame's
+// level with the line left extendable (") FROM t" glues on both passes).
+func TestArgsFrameFill(t *testing.T) {
+	// Many short args: two args per line would fit; fill packs as many
+	// as fit under the 80-column limit per line.
+	var b strings.Builder
+	b.WriteString("SELECT fn(")
+	for i := 0; i < 24; i++ {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(fmt.Sprintf("arg%02d", i))
+	}
+	b.WriteString(") FROM t")
+	got, ok := Layout(b.String(), "")
+	if !ok {
+		t.Fatal("Layout rejected many-short-args input")
+	}
+	if !strings.Contains(got, "(\n") {
+		t.Fatalf("overflowing args frame must break:\n%s", got)
+	}
+	again, ok := Layout(got, "")
+	if !ok || again != got {
+		t.Fatalf("fill not idempotent\n--- once ---\n%s\n--- twice ---\n%s", got, again)
+	}
+	if !sameTokenStreams(rawAtoms(b.String()), rawAtoms(got)) {
+		t.Fatal("token stream changed")
+	}
+
+	// Nested overflow: the inner frame fills inside the outer one.
+	inner := strings.Repeat("x", 70)
+	in2 := "SELECT wrap(aa, fn(" + inner + ", " + inner + ")) FROM t"
+	got2, ok := Layout(in2, "")
+	if !ok {
+		t.Fatal("Layout rejected nested args input")
+	}
+	if strings.Contains(got2, inner+", "+inner) {
+		t.Fatalf("nested overflowing frame must fill:\n%s", got2)
+	}
+	again2, ok := Layout(got2, "")
+	if !ok || again2 != got2 {
+		t.Fatalf("nested fill not idempotent\n--- once ---\n%s\n--- twice ---\n%s", got2, again2)
+	}
+
+	// An item ending exactly at column 80 must not ride the previous
+	// line (the fit check counts its trailing comma). An item whose own
+	// width leaves no room for the comma may overhang by exactly that
+	// comma — same class as an unbreakable-token overhang.
+	wide := strings.Repeat("x", 79)
+	in3 := "SELECT (" + wide + ", b, c, d) FROM t"
+	got3, ok := Layout(in3, "")
+	if !ok {
+		t.Fatal("Layout rejected wide-first-arg input")
+	}
+	for i, ln := range strings.Split(got3, "\n") {
+		n := len([]rune(strings.TrimSuffix(ln, ",")))
+		if n > 80 {
+			t.Fatalf("line %d is %d columns (> 80): %q", i+1, n, ln)
+		}
+	}
+	again3, ok := Layout(got3, "")
+	if !ok || again3 != got3 {
+		t.Fatalf("wide-arg fill not idempotent\n--- once ---\n%s\n--- twice ---\n%s", got3, again3)
+	}
+
+	// A short clause frame must be measured on its own fresh line, not
+	// on the previous clause's stale full line (lineOpen=false,
+	// curRunes leftover): the frame fits inline on the fresh line the
+	// clause opens. Falls in the regression window found by brute force
+	// (item width 74 at level+1 leaves the line at 74 columns).
+	item := strings.Repeat("w", 74)
+	in4 := "SELECT a, " + item + " ORDER BY (x, y)"
+	got4, ok := Layout(in4, "")
+	if !ok {
+		t.Fatal("Layout rejected stale-line frame input")
+	}
+	if !strings.Contains(got4, "ORDER BY (x, y)") {
+		t.Fatalf("short clause frame must stay inline:\n%s", got4)
+	}
+	again4, ok := Layout(got4, "")
+	if !ok || again4 != got4 {
+		t.Fatalf("stale-line frame not idempotent\n--- once ---\n%s\n--- twice ---\n%s", got4, again4)
 	}
 }
 
