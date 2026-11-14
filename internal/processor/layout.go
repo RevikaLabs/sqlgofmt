@@ -305,8 +305,8 @@ const (
 // another block comment. PostgreSQL nests /* /* */ */; the tokenizer does
 // not (it stops at the first */), so the tail would be re-tokenized as
 // SQL code. "/*" and "*/" inside string literals, quoted identifiers and
-// dollar-quoted strings do not count. Single-quote state follows ''
-// doubling; E'...\'...' backslash escapes are not tracked (such literals
+// dollar-quoted strings do not count. Single-quote state follows doubled
+// quotes; E'...\'...' backslash escapes are not tracked (such literals
 // are rare and the parse gate still applies).
 func hasNestedBlockComment(sql string) bool {
 	state := scanNormal
@@ -967,6 +967,7 @@ type layouter struct {
 	curLevel  int   // indent level of the pending line
 	lastA     *atom // last atom written on the pending line
 	last2A    *atom // atom before lastA
+	lastTokA  *atom // last token (non-comment) atom written
 	outEndsNL bool  // out ends with a newline
 	// lineOpen reports whether the pending line is a clause line that the
 	// next clause may extend (statement start, or a fresh clause line
@@ -1071,7 +1072,7 @@ func (l *layouter) br(level int) {
 	l.curRunes = 0
 	l.curLevel = level
 	l.curHasTok = false
-	l.lastA, l.last2A = nil, nil
+	l.lastA, l.last2A, l.lastTokA = nil, nil, nil
 	l.pendingBreak = false
 }
 
@@ -1121,6 +1122,15 @@ func (l *layouter) writeAtom(a *atom) {
 		// Never continue a "--" comment line: break first.
 		l.br(l.curLevel)
 	}
+	if l.curHasTok && isStringConst(a) && l.lastTokA != nil && isStringConst(l.lastTokA) &&
+		strings.Contains(l.src[l.lastTokA.end:a.start], "\n") {
+		// Adjacent string literals concatenate in PostgreSQL only when
+		// separated by pure whitespace containing a newline; a comment
+		// between them invalidates the query either way. Keep such pairs
+		// on different lines — the only form PostgreSQL accepts (the
+		// GoSQLX parse gate cannot see this constraint).
+		l.br(l.curLevel)
+	}
 	if a.kind == atomComment && a.trailing && l.curHasTok {
 		// Record before writing: the mark must point at the column the
 		// comment text will start at (indent + content + separator gap).
@@ -1134,6 +1144,9 @@ func (l *layouter) writeAtom(a *atom) {
 		l.writeRaw(" ")
 	}
 	l.writeText(a.text)
+	if a.kind == atomToken {
+		l.lastTokA = a
+	}
 	l.last2A, l.lastA = l.lastA, a
 }
 
@@ -1155,6 +1168,14 @@ func (l *layouter) fitsAhead(level, flat int, first *atom) bool {
 		gap = 1
 	}
 	return level*l.unitW+l.curRunes+gap+flat <= widthLimit
+}
+
+// isStringConst reports whether the atom is a PostgreSQL string constant
+// ('...', $$...$$) — adjacent such constants concatenate when separated by
+// whitespace containing a newline.
+func isStringConst(a *atom) bool {
+	return a.ttype == models.TokenTypeSingleQuotedString ||
+		a.ttype == models.TokenTypeDollarQuotedString
 }
 
 // flatHard measures the flat single-line width (runes) of atoms and
@@ -1224,6 +1245,21 @@ func (l *layouter) flatHardEnd(atoms []atom, atEnd bool) (int, bool) {
 			i = j + 1
 			continue
 		}
+		if isStringConst(a) {
+			// Adjacent string literals concatenate in PostgreSQL only
+			// across pure-whitespace newline; a comment between them
+			// invalidates the query either way. Keep such pairs off one
+			// line (the writeAtom guard enforces the newline; mark it
+			// hard so the fit math does not assume one line).
+			j := i - 1
+			for j >= 0 && atoms[j].kind == atomComment {
+				j--
+			}
+			if j >= 0 && isStringConst(&atoms[j]) &&
+				strings.Contains(l.src[atoms[j].end:a.start], "\n") {
+				hard = true
+			}
+		}
 		if needSpace(prev, prev2, a, l.src) {
 			width++
 		}
@@ -1285,6 +1321,10 @@ func (l *layouter) emitStmt(stmt []atom, level int) {
 	}
 	if segs[0].start > 0 {
 		l.emitExpr(stmt[:segs[0].start], level)
+		// Pre-segment atoms are leading comments: the statement keyword
+		// starts a fresh line below them (for "--" comments writeAtom's
+		// onLineComment guard does this; for block comments it does not).
+		l.lineOpen = false
 	}
 	for si := range segs {
 		l.emitClause(stmt, &segs[si], level)
@@ -1972,7 +2012,14 @@ func (l *layouter) emitArgsLines(lp, rp *atom, inner []atom, level int) {
 	if strings.TrimSpace(lines[0]) == "" && len(lines) > 1 {
 		start = 1 // content begins on the line after "("
 	}
+	// The common indent excludes the glued first line (content sharing
+	// the "(" line): its own leading whitespace is author style, not the
+	// alignment reference — including it made the padding normalization
+	// differ between the first and second pass (non-idempotent).
 	common := commonIndentLines(lines[start:])
+	if start == 0 && len(lines) > 1 {
+		common = commonIndentLines(lines[1:])
+	}
 	// Drop blank source lines (D8: the formatter introduces blank lines
 	// only between statements and CTE definitions).
 	end := len(lines)

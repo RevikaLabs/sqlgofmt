@@ -593,6 +593,29 @@ func TestSkipReasons(t *testing.T) {
 	}
 }
 
+// TestSpacedOperatorRejected pins the "< =" contract: the layout must
+// never silently join spaced operator characters into a new operator
+// ("=<", "<="), which would change the query's meaning behind every
+// gate. GoSQLX's parse gate rejects such input outright — the pinned
+// contract is ReasonParse with no output. (Direct output-based pinning
+// is impossible: the gate never lets the literal reach layout.)
+func TestSpacedOperatorRejected(t *testing.T) {
+	for _, in := range []string{
+		"SELECT a < = b FROM t",
+		"SELECT a > = b FROM t",
+		"SELECT a = > b FROM t",
+	} {
+		var r SkipReason
+		out, ok := LayoutWithReason(in, "", &r)
+		if ok || out != "" {
+			t.Fatalf("%q: spaced operator must never be re-laid (got ok=%v out=%q)", in, ok, out)
+		}
+		if r != ReasonParse {
+			t.Fatalf("%q: reason = %d (%s), want ReasonParse", in, r, SkipString(r))
+		}
+	}
+}
+
 // TestTrailingComments pins the trailing-comment behavior: a comment with
 // code before it on the same source line ("trailing") rides that line
 // instead of forcing a break, and contiguous lines with trailing comments
@@ -704,6 +727,69 @@ func TestTrailingComments(t *testing.T) {
 		if strings.HasSuffix(line, "  -- first") || strings.HasSuffix(line, "  -- second") {
 			t.Fatalf("comments aligned past the 80-column limit:\n%s", got)
 		}
+	}
+}
+
+// TestAdjacentStringLiterals pins a PostgreSQL whitespace constraint the
+// parse gate cannot see: adjacent string literals concatenate only when
+// separated by pure whitespace containing a newline, so the layout must
+// keep them off one line. With a comment between the literals the input
+// is invalid PostgreSQL either way; the layout still keeps the literals
+// on different lines (the closer-to-valid form).
+func TestAdjacentStringLiterals(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       string
+		lit1     string
+		lit2     string
+		sameLine bool // false: must land on different lines
+	}{
+		{"plain", "SELECT 'a'\n'b' FROM t", "'a'", "'b'", false},
+		{"block comment between", "SELECT 'x' /* c */\n'y' FROM t", "'x'", "'y'", false},
+		{"line comment between", "SELECT 'x' -- c\n'y' FROM t", "'x'", "'y'", false},
+		{"inline pair stays inline", "SELECT 'a', 'b' FROM t", "'a'", "'b'", true},
+	}
+	for _, tc := range cases {
+		out, ok := Layout(tc.in, "")
+		if !ok {
+			t.Fatalf("%s: Layout rejected input", tc.name)
+		}
+		for _, line := range strings.Split(out, "\n") {
+			both := strings.Contains(line, tc.lit1) && strings.Contains(line, tc.lit2)
+			if both && !tc.sameLine {
+				t.Fatalf("%s: literals must be on different lines (PostgreSQL concatenation), got:\n%s", tc.name, out)
+			}
+		}
+		if tc.sameLine {
+			found := false
+			for _, line := range strings.Split(out, "\n") {
+				if strings.Contains(line, tc.lit1) && strings.Contains(line, tc.lit2) {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("%s: inline pair was broken apart:\n%s", tc.name, out)
+			}
+		}
+		again, ok := Layout(out, "")
+		if !ok || again != out {
+			t.Fatalf("%s: not idempotent\n--- once ---\n%s\n--- twice ---\n%s", tc.name, out, again)
+		}
+	}
+}
+
+// TestGluedArgsFrameIdempotent pins the fuzz-found regression: a multiline
+// args frame with content glued to the "(" line must be a fixed point —
+// the padding normalization used to differ between passes.
+func TestGluedArgsFrameIdempotent(t *testing.T) {
+	in := "SEt( 0\n  ())"
+	out, ok := Layout(in, "")
+	if !ok {
+		t.Fatal("Layout rejected glued args frame")
+	}
+	again, ok := Layout(out, "")
+	if !ok || again != out {
+		t.Fatalf("glued args frame not idempotent\n--- once ---\n%q\n--- twice ---\n%q", out, again)
 	}
 }
 

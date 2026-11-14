@@ -164,6 +164,31 @@ const q = `SELECT u.id, u.email FROM users u LEFT JOIN orders o ON o.user_id = u
 	ORDER BY u.email LIMIT 10`
 ```
 
+## Testing
+
+The safety net has three layers:
+
+- **Corpus** (`testdata/corpus/`): Go files whose SQL literals are
+  sqlgofmt's own canonical output, reviewed before being committed.
+  `TestCorpusRoundTrip` runs every fixture through the formatter and
+  requires a byte-identical result — an idempotency/regression guard: a
+  change that alters output for any covered construct trips a fixture
+  immediately. Regenerate fixtures with
+  `go run ./cmd/sqlgofmt -w testdata/corpus/*.go`.
+- **Fuzzer** (`FuzzLayout`): Go native fuzzing seeded from the corpus.
+  Properties: a skipped literal never produces output; a formatted
+  literal is a fixed point (`Layout(Layout(x)) == Layout(x)`) and its
+  token stream is unchanged. Run a campaign with
+  `go test ./internal/processor/ -fuzz FuzzLayout -fuzztime 90s`.
+- **Oracle** (behind the `pgquery` build tag): the real PostgreSQL parser
+  (`pg_query_go`) compares the parse trees of input and output — with
+  source Location fields stripped — proving formatting never changes a
+  query's meaning, which the GoSQLX-based token gate cannot fully see.
+  This caught, and now pins, the adjacent-string-literals rule
+  (`'a'\n'b'` concatenates only across a newline). Requires cgo
+  (~minutes on first build); `go install` stays cgo-free:
+  `go test -tags pgquery ./internal/processor/ -run TestOracle`.
+
 ## Opt-out
 
 To exclude a single literal, put a comment with `sqlgofmt:ignore` on the

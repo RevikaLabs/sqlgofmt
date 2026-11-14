@@ -157,13 +157,16 @@ func formatLiteral(body string, goIndent string, opt Options, ctx string) (strin
 		return "", false
 	}
 
-	// Rule: must start with a SQL keyword. DDL-leading literals are
-	// reported as DDL (they are skipped by design, not unsupported).
-	if ddlStartKeywords[firstStatementKeyword(core)] {
+	// Rule: must start with a SQL keyword. Leading comments (a header
+	// above the query is common in real code) do not disqualify the
+	// literal. DDL-leading literals are reported as DDL (they are
+	// skipped by design, not unsupported).
+	probe := stripLeadingComments(core)
+	if ddlStartKeywords[firstStatementKeyword(probe)] {
 		debugf(opt, "%s: skipped (%s)", ctx, SkipString(ReasonDDL))
 		return "", false
 	}
-	if !startsSQLKeyword(strings.TrimSpace(core)) {
+	if !startsSQLKeyword(strings.TrimSpace(probe)) {
 		debugf(opt, "%s: skipped (does not start with a SQL statement keyword)", ctx)
 		return "", false
 	}
@@ -277,8 +280,46 @@ func splitBody(body string) (prefix, core, suffix string) {
 
 func isBodyWS(c byte) bool { return c == '\n' || c == ' ' || c == '\t' }
 
-// startsSQLKeyword reports whether s starts with one of the SQL start
-// keywords, followed by a non-word character or end of string.
+// stripLeadingComments removes leading blank lines, "--" comment lines and
+// one /* ... */ block comment run from the start of a literal body, so the
+// statement-keyword gate sees the keyword behind a header comment. Block
+// comments nest (PostgreSQL rule); an unterminated block comment makes the
+// whole remainder comments (the parse gate rejects it later anyway).
+func stripLeadingComments(s string) string {
+	rest := s
+	for {
+		trimmed := strings.TrimLeft(rest, " \t\r\n")
+		if strings.HasPrefix(trimmed, "--") {
+			nl := strings.IndexByte(trimmed, '\n')
+			if nl < 0 {
+				return ""
+			}
+			rest = trimmed[nl+1:]
+			continue
+		}
+		if strings.HasPrefix(trimmed, "/*") {
+			depth := 0
+			for i := 0; i+1 < len(trimmed); i++ {
+				if strings.HasPrefix(trimmed[i:], "/*") {
+					depth++
+					i++
+				} else if strings.HasPrefix(trimmed[i:], "*/") {
+					depth--
+					if depth == 0 {
+						rest = trimmed[i+2:]
+						goto next
+					}
+					i++
+				}
+			}
+			return ""
+		}
+		return trimmed
+	next:
+		continue
+	}
+}
+
 func startsSQLKeyword(s string) bool {
 	up := strings.ToUpper(s)
 	for _, kw := range sqlStartKeywords {
