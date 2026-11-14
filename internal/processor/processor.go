@@ -8,6 +8,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/ajitpratap0/GoSQLX/pkg/sql/keywords"
@@ -108,11 +109,10 @@ func Process(filename string, src []byte, opt Options) ([]byte, bool, error) {
 		return src, false, nil
 	}
 
-	out := make([]byte, len(src))
-	copy(out, src)
+	out := slices.Clone(src)
 	// Apply edits in reverse offset order so earlier offsets stay valid.
-	for i := len(edits) - 1; i >= 0; i-- {
-		e := edits[i]
+	for _, e := range slices.Backward(edits) {
+
 		next := make([]byte, 0, len(out)-(e.end-e.start)+len(e.newBytes))
 		next = append(next, out[:e.start]...)
 		next = append(next, e.newBytes...)
@@ -290,11 +290,11 @@ func stripLeadingComments(s string) string {
 	for {
 		trimmed := strings.TrimLeft(rest, " \t\r\n")
 		if strings.HasPrefix(trimmed, "--") {
-			nl := strings.IndexByte(trimmed, '\n')
-			if nl < 0 {
+			_, after, ok := strings.Cut(trimmed, "\n")
+			if !ok {
 				return ""
 			}
-			rest = trimmed[nl+1:]
+			rest = after
 			continue
 		}
 		if strings.HasPrefix(trimmed, "/*") {
@@ -343,7 +343,7 @@ func isWordChar(c byte) bool {
 func commonIndent(core string) string {
 	indent := ""
 	have := false
-	for _, line := range strings.Split(core, "\n") {
+	for line := range strings.SplitSeq(core, "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
@@ -369,10 +369,7 @@ func leadingSpaceTab(s string) string {
 }
 
 func commonPrefix(a, b string) string {
-	n := len(a)
-	if len(b) < n {
-		n = len(b)
-	}
+	n := min(len(b), len(a))
 	i := 0
 	for i < n && a[i] == b[i] {
 		i++

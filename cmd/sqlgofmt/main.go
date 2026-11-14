@@ -9,7 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/ajitpratap0/GoSQLX/pkg/sql/keywords"
@@ -36,7 +36,7 @@ func resolveDialect(name string) (keywords.SQLDialect, error) {
 		for n := range dialectMap {
 			names = append(names, n)
 		}
-		sort.Strings(names)
+		slices.Sort(names)
 		return "", fmt.Errorf("unsupported dialect %q (supported: %s)", name, strings.Join(names, ", "))
 	}
 	return d, nil
@@ -250,7 +250,7 @@ func collectFiles(paths []string) ([]string, error) {
 			return nil, err
 		}
 	}
-	sort.Strings(files)
+	slices.Sort(files)
 	return files, nil
 }
 

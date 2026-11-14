@@ -178,7 +178,7 @@ func TestLayoutGuideCorpus(t *testing.T) {
 			}
 			// Structural check: broken lists use trailing commas — no
 			// line may start with a comma.
-			for _, line := range strings.Split(got, "\n") {
+			for line := range strings.SplitSeq(got, "\n") {
 				if strings.HasPrefix(strings.TrimLeft(line, "\t "), ",") {
 					t.Fatalf("guide %s has a leading comma line (must be trailing):\n%s", tc.name, got)
 				}
@@ -702,7 +702,7 @@ func TestTrailingComments(t *testing.T) {
 		if !ok || again != got {
 			t.Fatalf("multiline atom case not idempotent\n--- in ---\n%s\n--- once ---\n%s\n--- twice ---\n%s", in, got, again)
 		}
-		for _, line := range strings.Split(got, "\n") {
+		for line := range strings.SplitSeq(got, "\n") {
 			if strings.Contains(line, "'p") && strings.Contains(line, "  ") {
 				t.Fatalf("padding leaked into a string literal line:\n%s", got)
 			}
@@ -724,7 +724,7 @@ func TestTrailingComments(t *testing.T) {
 	if !ok || again != got {
 		t.Fatalf("over-limit run case not idempotent\n--- once ---\n%s\n--- twice ---\n%s", got, again)
 	}
-	for _, line := range strings.Split(got, "\n") {
+	for line := range strings.SplitSeq(got, "\n") {
 		if strings.HasSuffix(line, "  -- first") || strings.HasSuffix(line, "  -- second") {
 			t.Fatalf("comments aligned past the 80-column limit:\n%s", got)
 		}
@@ -755,7 +755,7 @@ func TestAdjacentStringLiterals(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s: Layout rejected input", tc.name)
 		}
-		for _, line := range strings.Split(out, "\n") {
+		for line := range strings.SplitSeq(out, "\n") {
 			both := strings.Contains(line, tc.lit1) && strings.Contains(line, tc.lit2)
 			if both && !tc.sameLine {
 				t.Fatalf("%s: literals must be on different lines (PostgreSQL concatenation), got:\n%s", tc.name, out)
@@ -763,7 +763,7 @@ func TestAdjacentStringLiterals(t *testing.T) {
 		}
 		if tc.sameLine {
 			found := false
-			for _, line := range strings.Split(out, "\n") {
+			for line := range strings.SplitSeq(out, "\n") {
 				if strings.Contains(line, tc.lit1) && strings.Contains(line, tc.lit2) {
 					found = true
 				}
@@ -1416,11 +1416,11 @@ func TestArgsFrameFill(t *testing.T) {
 	// as fit under the 80-column limit per line.
 	var b strings.Builder
 	b.WriteString("SELECT fn(")
-	for i := 0; i < 24; i++ {
+	for i := range 24 {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		b.WriteString(fmt.Sprintf("arg%02d", i))
+		fmt.Fprintf(&b, "arg%02d", i)
 	}
 	b.WriteString(") FROM t")
 	got, ok := Layout(b.String(), "")
@@ -1539,7 +1539,7 @@ func TestG14LineCommentNeverSwallowsTokens(t *testing.T) {
 			t.Fatalf("Layout rejected %q", tc.in)
 		}
 		visible := false
-		for _, line := range strings.Split(out, "\n") {
+		for line := range strings.SplitSeq(out, "\n") {
 			if !strings.Contains(line, "--") && strings.Contains(line, tc.wantVisible) {
 				visible = true
 			}
@@ -1567,7 +1567,7 @@ func TestProcessBaseIndentFixedPoint(t *testing.T) {
 	if !changed {
 		t.Fatal("expected a change")
 	}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		out2, changed2, err := Process("test.go", out, opt)
 		if err != nil {
 			t.Fatalf("run %d error: %v", i, err)

@@ -14,9 +14,10 @@ package processor
 // broken content always starts fresh lines.
 
 import (
+	"cmp"
 	"context"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -112,7 +113,8 @@ func firstStatementKeyword(s string) string {
 				s = s[k+2:]
 				continue
 			}
-			break
+			// Unterminated comment: stop scanning, the loop break below
+			// leaves s as-is.
 		}
 		break
 	}
@@ -419,8 +421,7 @@ func atomize(src, masked string) ([]atom, bool) {
 	tkz := tokenizer.GetTokenizer()
 	toks, err := tkz.Tokenize([]byte(masked))
 	// Comments must be copied before the tokenizer returns to the pool.
-	comments := make([]models.Comment, len(tkz.Comments))
-	copy(comments, tkz.Comments)
+	comments := slices.Clone(tkz.Comments)
 	tokenizer.PutTokenizer(tkz)
 	if err != nil {
 		return nil, false
@@ -428,7 +429,7 @@ func atomize(src, masked string) ([]atom, bool) {
 
 	// Token positions are (line, byte-column) pairs; build a line-start table.
 	starts := []int{0}
-	for i := 0; i < len(masked); i++ {
+	for i := range len(masked) {
 		if masked[i] == '\n' {
 			starts = append(starts, i+1)
 		}
@@ -471,7 +472,7 @@ func atomize(src, masked string) ([]atom, bool) {
 		}
 		atoms = append(atoms, atom{kind: atomComment, text: strings.TrimRight(src[s:e], "\r\n"), start: s, end: e})
 	}
-	sort.Slice(atoms, func(i, j int) bool { return atoms[i].start < atoms[j].start })
+	slices.SortFunc(atoms, func(a, b atom) int { return cmp.Compare(a.start, b.start) })
 	for i := range atoms {
 		if atoms[i].kind != atomComment || i == 0 {
 			continue
@@ -559,7 +560,7 @@ func needSpace(prev, prev2, cur *atom, src string) bool {
 			if prev2 != nil && prev2.ttype == models.TokenTypePeriod {
 				return true
 			}
-			return strings.IndexAny(src[prev.end:cur.start], " \t\r\n") >= 0
+			return strings.ContainsAny(src[prev.end:cur.start], " \t\r\n")
 		}
 		if isFuncName(prev) {
 			return false
@@ -567,7 +568,7 @@ func needSpace(prev, prev2, cur *atom, src string) bool {
 		// Keyword before "(": keep the source spacing too — it covers
 		// function-like keywords (replace(...)) as well as structural
 		// VALUES ( / ON CONFLICT ( / EXISTS ( which are spaced in source.
-		return strings.IndexAny(src[prev.end:cur.start], " \t\r\n") >= 0
+		return strings.ContainsAny(src[prev.end:cur.start], " \t\r\n")
 	}
 	if ct == models.TokenTypeLBracket {
 		return false
@@ -1015,7 +1016,7 @@ func alignTrailingComments(out string, marks []trailMark) string {
 		return out
 	}
 	lines := strings.Split(out, "\n")
-	sort.Slice(marks, func(i, j int) bool { return marks[i].line < marks[j].line })
+	slices.SortFunc(marks, func(a, b trailMark) int { return cmp.Compare(a.line, b.line) })
 	for g := 0; g < len(marks); {
 		e := g + 1
 		for e < len(marks) && marks[e].line == marks[e-1].line+1 {
@@ -1101,8 +1102,8 @@ func (l *layouter) writeText(s string) {
 	l.cur.WriteString(s)
 	if n := strings.Count(s, "\n"); n > 0 {
 		l.lineNo += n
-		if i := strings.LastIndexByte(s, '\n'); i >= 0 {
-			l.curRunes = utf8.RuneCountInString(s[i+1:])
+		if _, after, ok := strings.CutLast(s, "\n"); ok {
+			l.curRunes = utf8.RuneCountInString(after)
 		}
 	} else {
 		l.curRunes += utf8.RuneCountInString(s)
@@ -1285,8 +1286,8 @@ func (l *layouter) groupHard(atoms []atom) bool {
 func (l *layouter) emitBlock(atoms []atom, level int) {
 	parts, semis := splitOn(atoms, isSemi)
 	nonEmpty := -1
-	for i := len(parts) - 1; i >= 0; i-- {
-		if len(parts[i]) > 0 {
+	for i, part := range slices.Backward(parts) {
+		if len(part) > 0 {
 			nonEmpty = i
 			break
 		}

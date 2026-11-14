@@ -108,7 +108,7 @@ func TestListMode(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "unformatted.go"), []byte(unformatted), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	changed, listMode, err = run([]string{"-l", dir})
+	changed, _, err = run([]string{"-l", dir})
 	if err == nil {
 		t.Fatal("expected error for broken file, got nil")
 	}
