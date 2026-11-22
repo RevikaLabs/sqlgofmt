@@ -11,7 +11,7 @@ sqlgofmt twice produces the same result.
 ## Install
 
 ```sh
-go install github.com/RevikaLabs/sqlgofmt/cmd/sqlgofmt@latest
+go install go.revika.io/sqlgofmt/cmd/sqlgofmt@latest
 ```
 
 ## Usage

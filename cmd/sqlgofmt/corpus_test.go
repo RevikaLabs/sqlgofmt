@@ -7,7 +7,7 @@ import (
 
 	"github.com/ajitpratap0/GoSQLX/pkg/sql/keywords"
 
-	"github.com/RevikaLabs/sqlgofmt/internal/processor"
+	"go.revika.io/sqlgofmt/internal/processor"
 )
 
 // TestCorpusRoundTrip walks testdata/corpus — Go files whose SQL literals

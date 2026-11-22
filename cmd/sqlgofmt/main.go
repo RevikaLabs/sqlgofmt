@@ -15,7 +15,7 @@ import (
 	"github.com/ajitpratap0/GoSQLX/pkg/sql/keywords"
 	"github.com/pmezard/go-difflib/difflib"
 
-	"github.com/RevikaLabs/sqlgofmt/internal/processor"
+	"go.revika.io/sqlgofmt/internal/processor"
 )
 
 var dialectMap = map[string]keywords.SQLDialect{
@@ -49,7 +49,7 @@ to a house style (left-aligned keywords, tab indent, trailing commas,
 AND/OR at line start, lists broken at 80 columns / >4 items) and never
 changes tokens, identifiers or comments. DDL is left untouched.
 Style synthesized from sqlstyle.guide, Mozilla's data-docs guide and
-dbt conventions. Details: github.com/RevikaLabs/sqlgofmt
+dbt conventions. Details: go.revika.io/sqlgofmt
 
 Usage:
   sqlgofmt [flags] <path>...

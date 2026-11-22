@@ -1,4 +1,4 @@
-module github.com/RevikaLabs/sqlgofmt
+module go.revika.io/sqlgofmt
 
 go 1.27.4
 
